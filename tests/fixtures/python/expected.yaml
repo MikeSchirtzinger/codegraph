@@ -1,0 +1,112 @@
+# Ground truth manifest for tests/fixtures/python.
+# Schema documented in ../README.md — read that first.
+fixture: python
+language: python
+root: tests/fixtures/python
+description: >
+  Minimal Python project exercising the resolver cascade and defects D1-D4.
+  gamma.py's two wildcard imports collide on `helper` — Python itself
+  silently lets the second shadow the first at runtime, no error at all,
+  which is D3's "blended" failure mode occurring natively in the language.
+  even.py/odd.py mutually recurse via `from X import Y` (bare-call) imports,
+  so that cycle resolves via R5 rather than R1 — see "Contract
+  interpretations" below.
+
+# Ground truth for qualified_name computation (R0's accept criterion).
+# Convention: full relative file path from the fixture root, extension
+# stripped, `/` normalized to `::` (Python gets no elision, like TypeScript;
+# unlike Rust's crate-root convention — see ../README.md).
+nodes:
+  - {file: main.py, name: log_startup, node_type: function, qualified_name: "main::log_startup"}
+  - {file: main.py, name: run, node_type: function, qualified_name: "main::run"}
+  - {file: alpha.py, name: helper, node_type: function, qualified_name: "alpha::helper"}
+  - {file: beta.py, name: helper, node_type: function, qualified_name: "beta::helper"}
+  - {file: gamma.py, name: dispatch, node_type: function, qualified_name: "gamma::dispatch"}
+  - {file: db/connection.py, name: connect, node_type: function, qualified_name: "db::connection::connect"}
+  - {file: even.py, name: is_even, node_type: function, qualified_name: "even::is_even"}
+  - {file: odd.py, name: is_odd, node_type: function, qualified_name: "odd::is_odd"}
+
+# Ground truth for the resolver cascade (R1's accept criterion). Field
+# semantics documented once in ../README.md.
+edges:
+  - case: a
+    defect: D1
+    edge_type: calls
+    from: "main::run"
+    from_file: main.py
+    to_name: log_startup
+    to_type: function
+    confidence: RESOLVED
+    resolved_by: r3
+    target: "main::log_startup"
+    candidates: null
+
+  - case: b
+    defect: D2
+    edge_type: calls
+    from: "main::run"
+    from_file: main.py
+    to_name: "db.connection.connect"
+    to_type: function
+    confidence: RESOLVED
+    resolved_by: r1
+    target: "db::connection::connect"
+    candidates: null
+
+  - case: e
+    defect: null
+    edge_type: calls
+    from: "main::run"
+    from_file: main.py
+    to_name: "os.getenv"
+    to_type: function
+    confidence: UNRESOLVED
+    resolved_by: r6
+    target: null
+    candidates: []
+
+  - case: c
+    defect: D3
+    edge_type: calls
+    from: "gamma::dispatch"
+    from_file: gamma.py
+    to_name: helper
+    to_type: function
+    confidence: AMBIGUOUS
+    resolved_by: r6
+    target: null
+    candidates: ["alpha::helper", "beta::helper"]
+
+  - case: d-cycle-even
+    defect: D4
+    edge_type: calls
+    from: "even::is_even"
+    from_file: even.py
+    to_name: is_odd
+    to_type: function
+    confidence: RESOLVED
+    resolved_by: r5
+    target: "odd::is_odd"
+    candidates: null
+    note: >
+      `is_odd` is a bare identifier (from-import, not a qualified module
+      call), so R1/R2 never apply; R4 doesn't consult Python import facts in
+      v1 (Rust-only slot); R5 (project-unique bare name) is the first rule
+      that resolves it.
+
+  - case: d-cycle-odd
+    defect: D4
+    edge_type: calls
+    from: "odd::is_odd"
+    from_file: odd.py
+    to_name: is_even
+    to_type: function
+    confidence: RESOLVED
+    resolved_by: r5
+    target: "even::is_even"
+    candidates: null
+
+# Derived file_ref cross-file cycles (D4's fix).
+cycles:
+  - files: [even.py, odd.py]
+    via: calls

@@ -1,0 +1,42 @@
+# Ground truth manifest for tests/fixtures/rename-refactor/before.
+# Schema documented in ../../README.md — read that first.
+fixture: rename-refactor/before
+language: rust
+root: tests/fixtures/rename-refactor/before
+description: >
+  Pre-refactor state: target.rs defines `helper`, and two callers both
+  reach it by the same qualified path. Compare against ../after/expected.yaml
+  and see ../expected.yaml for the kill-test this pair encodes.
+
+nodes:
+  - {file: src/target.rs, name: helper, node_type: function, qualified_name: "target::helper"}
+  - {file: src/stale_caller.rs, name: use_stale, node_type: function, qualified_name: "stale_caller::use_stale"}
+  - {file: src/updated_caller.rs, name: use_updated, node_type: function, qualified_name: "updated_caller::use_updated"}
+  - {file: src/main.rs, name: main, node_type: function, qualified_name: main}
+
+edges:
+  - case: pre-rename-stale-caller
+    defect: null
+    edge_type: calls
+    from: "stale_caller::use_stale"
+    from_file: src/stale_caller.rs
+    to_name: "target::helper"
+    to_type: function
+    confidence: RESOLVED
+    resolved_by: r1
+    target: "target::helper"
+    candidates: null
+
+  - case: pre-rename-updated-caller
+    defect: null
+    edge_type: calls
+    from: "updated_caller::use_updated"
+    from_file: src/updated_caller.rs
+    to_name: "target::helper"
+    to_type: function
+    confidence: RESOLVED
+    resolved_by: r1
+    target: "target::helper"
+    candidates: null
+
+cycles: []

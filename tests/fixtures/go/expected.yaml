@@ -1,0 +1,152 @@
+# Ground truth manifest for tests/fixtures/go.
+# Schema documented in ../README.md — read that first.
+fixture: go
+language: go
+root: tests/fixtures/go
+description: >
+  Minimal Go module exercising the resolver cascade and defects D1-D4.
+  gamma.go dot-imports alpha and beta (case c, D3) since ordinary Go calls
+  are always package-qualified and therefore never syntactically ambiguous.
+  evenodd/even.go and odd.go mutually recurse within one package across two
+  files (a cross-package cycle would be an illegal Go import cycle), which
+  is why that case resolves via R5 rather than R3 — see "Contract
+  interpretations" below. handler/types.go + serve.go add case f: a
+  cross-file receiver-method (member_of) case, added 2026-07-10 once R2's
+  validator flagged that member_of resolution (Go's cross-file receiver
+  fallback, included in deps/rdeps/impact traversal) had no permanent
+  fixture coverage.
+
+# Ground truth for qualified_name computation (R0's accept criterion).
+# Convention: Go's module unit is the PACKAGE (a directory), not the file —
+# unlike Rust/Python/TypeScript. qualified_name = directory path relative to
+# the fixture root (`/` normalized to `::`; empty for root-level package
+# main), then the item name. Multiple files in one package share the same
+# prefix.
+nodes:
+  - {file: main.go, name: LogStartup, node_type: function, qualified_name: LogStartup}
+  - {file: main.go, name: Run, node_type: function, qualified_name: Run}
+  - {file: main.go, name: main, node_type: function, qualified_name: main}
+  - {file: gamma.go, name: Dispatch, node_type: function, qualified_name: Dispatch}
+  - {file: alpha/alpha.go, name: Helper, node_type: function, qualified_name: "alpha::Helper"}
+  - {file: beta/beta.go, name: Helper, node_type: function, qualified_name: "beta::Helper"}
+  - {file: db/db.go, name: Connect, node_type: function, qualified_name: "db::Connect"}
+  - {file: evenodd/even.go, name: IsEven, node_type: function, qualified_name: "evenodd::IsEven"}
+  - {file: evenodd/odd.go, name: IsOdd, node_type: function, qualified_name: "evenodd::IsOdd"}
+  - {file: handler/types.go, name: Handler, node_type: struct, qualified_name: "handler::Handler"}
+  - {file: handler/serve.go, name: Serve, node_type: function, qualified_name: "handler::Serve"}
+
+# Ground truth for the resolver cascade (R1's accept criterion). Field
+# semantics documented once in ../README.md.
+edges:
+  - case: a
+    defect: D1
+    edge_type: calls
+    from: Run
+    from_file: main.go
+    to_name: LogStartup
+    to_type: function
+    confidence: RESOLVED
+    resolved_by: r3
+    target: LogStartup
+    candidates: null
+
+  - case: b
+    defect: D2
+    edge_type: calls
+    from: Run
+    from_file: main.go
+    to_name: "db.Connect"
+    to_type: function
+    confidence: RESOLVED
+    resolved_by: r1
+    target: "db::Connect"
+    candidates: null
+
+  - case: e
+    defect: null
+    edge_type: calls
+    from: Run
+    from_file: main.go
+    to_name: "os.Getenv"
+    to_type: function
+    confidence: UNRESOLVED
+    resolved_by: r6
+    target: null
+    candidates: []
+
+  - case: c
+    defect: D3
+    edge_type: calls
+    from: Dispatch
+    from_file: gamma.go
+    to_name: Helper
+    to_type: function
+    confidence: AMBIGUOUS
+    resolved_by: r6
+    target: null
+    candidates: ["alpha::Helper", "beta::Helper"]
+
+  - case: d-cycle-even
+    defect: D4
+    edge_type: calls
+    from: "evenodd::IsEven"
+    from_file: evenodd/even.go
+    to_name: IsOdd
+    to_type: function
+    confidence: RESOLVED
+    resolved_by: r5
+    target: "evenodd::IsOdd"
+    candidates: null
+    note: >
+      IsOdd is called bare (same-package, implicit scope, no import) from a
+      DIFFERENT FILE than its definition, so R3 (same-file) does not apply.
+      v1's cascade has no same-package tier, so this relies on R5
+      (project-unique bare name) — which happens to be correct here, but a
+      same-named collision in another package would incorrectly go
+      AMBIGUOUS despite being valid, unambiguous Go. Documented limitation,
+      not a defect this fixture is asserting must be fixed.
+
+  - case: d-cycle-odd
+    defect: D4
+    edge_type: calls
+    from: "evenodd::IsOdd"
+    from_file: evenodd/odd.go
+    to_name: IsEven
+    to_type: function
+    confidence: RESOLVED
+    resolved_by: r5
+    target: "evenodd::IsEven"
+    candidates: null
+
+  - case: f
+    defect: null
+    edge_type: member_of
+    from: "handler::Serve"
+    from_file: handler/serve.go
+    to_name: Handler
+    to_type: struct
+    confidence: RESOLVED
+    resolved_by: r5
+    target: "handler::Handler"
+    candidates: null
+    note: >
+      Added 2026-07-10: cross-file receiver-method resolution, previously
+      untested by any permanent fixture (R2's validator had to build a
+      synthetic to verify it). NOT a `calls` edge — Go's extractor emits
+      `member_of` for a method's receiver type (from -> to is method ->
+      struct, the reverse of `contains`, since the method's node_id is the
+      only one known at extraction time; see rust.rs-equivalent comment in
+      go.rs's extract_method). to_name "Handler" is bare (receiver syntax
+      is never package-qualified within the same package), and Handler
+      lives in a DIFFERENT FILE (types.go) than Serve (serve.go) — same
+      same-package/cross-file shape as the d-cycle case above, so this
+      resolves via R5 (project-unique bare struct name) for the same
+      reason: v1's cascade has no same-package tier, only same-file (R3)
+      and project-wide (R5). Also unlike every other edge in this suite,
+      to_type here is "struct", not "function" — see ../README.md's schema
+      section, updated to note edge_type/to_type vary by case.
+
+# Derived file_ref cross-file cycles (D4's fix).
+cycles:
+  - files: [evenodd/even.go, evenodd/odd.go]
+    via: calls

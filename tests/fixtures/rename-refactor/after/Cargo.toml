@@ -1,0 +1,8 @@
+[package]
+name = "fixture-rename-after"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "fixture-rename-after"
+path = "src/main.rs"

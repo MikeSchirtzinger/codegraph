@@ -1,0 +1,166 @@
+# Ground truth manifest for tests/fixtures/rust.
+# Schema documented in ../README.md — read that first.
+fixture: rust
+language: rust
+root: tests/fixtures/rust
+description: >
+  Minimal Rust crate exercising the full resolver cascade (R1-R6) and
+  defects D1-D4. main.rs is the crate root (no module-path prefix for its
+  own items); db.rs/db/connection.rs is a nested module reached only via a
+  qualified path; alpha.rs/beta.rs collide on the name `helper`; even.rs/
+  odd.rs mutually recurse across files.
+
+# Ground truth for qualified_name computation (R0's accept criterion).
+# Convention (full rationale in ../README.md "Contract interpretations"):
+#   - separators normalized to `::`; file path relative to the fixture root,
+#     extension stripped, with the leading `src` segment elided.
+#   - EXCEPT: the crate-root file (main.rs here) contributes NO segment of
+#     its own — its items sit directly at the crate root.
+#   - containment chain (inline `mod`, `impl`) is inserted between the
+#     file-derived module path and the item name.
+nodes:
+  - {file: src/main.rs, name: log_startup, node_type: function, qualified_name: log_startup}
+  - {file: src/main.rs, name: run, node_type: function, qualified_name: run}
+  - {file: src/main.rs, name: main, node_type: function, qualified_name: main}
+  - {file: src/alpha.rs, name: helper, node_type: function, qualified_name: "alpha::helper"}
+  - {file: src/alpha.rs, name: unique_alpha_fn, node_type: function, qualified_name: "alpha::unique_alpha_fn"}
+  - {file: src/beta.rs, name: helper, node_type: function, qualified_name: "beta::helper"}
+  - {file: src/gamma.rs, name: dispatch, node_type: function, qualified_name: "gamma::dispatch"}
+  - {file: src/gamma.rs, name: dispatch_unique, node_type: function, qualified_name: "gamma::dispatch_unique"}
+  - {file: src/delta.rs, name: call_helper_via_import, node_type: function, qualified_name: "delta::call_helper_via_import"}
+  - {file: src/delta.rs, name: call_connect_via_module_import, node_type: function, qualified_name: "delta::call_connect_via_module_import"}
+  - {file: src/db.rs, name: connection, node_type: module, qualified_name: "db::connection"}
+  - {file: src/db/connection.rs, name: connect, node_type: function, qualified_name: "db::connection::connect"}
+  - {file: src/even.rs, name: is_even, node_type: function, qualified_name: "even::is_even"}
+  - {file: src/odd.rs, name: is_odd, node_type: function, qualified_name: "odd::is_odd"}
+
+# Ground truth for the resolver cascade (R1's accept criterion). Field
+# semantics are documented once in ../README.md.
+edges:
+  - case: a
+    defect: D1
+    edge_type: calls
+    from: run
+    from_file: src/main.rs
+    to_name: log_startup
+    to_type: function
+    confidence: RESOLVED
+    resolved_by: r3
+    target: log_startup
+    candidates: null
+
+  - case: b
+    defect: D2
+    edge_type: calls
+    from: run
+    from_file: src/main.rs
+    to_name: "db::connection::connect"
+    to_type: function
+    confidence: RESOLVED
+    resolved_by: r1
+    target: "db::connection::connect"
+    candidates: null
+
+  - case: e
+    defect: null
+    edge_type: calls
+    from: run
+    from_file: src/main.rs
+    to_name: "std::env::args"
+    to_type: function
+    confidence: UNRESOLVED
+    resolved_by: r6
+    target: null
+    candidates: []
+
+  - case: c
+    defect: D3
+    edge_type: calls
+    from: "gamma::dispatch"
+    from_file: src/gamma.rs
+    to_name: helper
+    to_type: function
+    confidence: AMBIGUOUS
+    resolved_by: r6
+    target: null
+    candidates: ["alpha::helper", "beta::helper"]
+
+  - case: d-cycle-even
+    defect: D4
+    edge_type: calls
+    from: "even::is_even"
+    from_file: src/even.rs
+    to_name: "odd::is_odd"
+    to_type: function
+    confidence: RESOLVED
+    resolved_by: r1
+    target: "odd::is_odd"
+    candidates: null
+
+  - case: d-cycle-odd
+    defect: D4
+    edge_type: calls
+    from: "odd::is_odd"
+    from_file: src/odd.rs
+    to_name: "even::is_even"
+    to_type: function
+    confidence: RESOLVED
+    resolved_by: r1
+    target: "even::is_even"
+    candidates: null
+
+  - case: bonus-r4-named-import
+    defect: null
+    edge_type: calls
+    from: "delta::call_helper_via_import"
+    from_file: src/delta.rs
+    to_name: helper
+    to_type: function
+    confidence: RESOLVED
+    resolved_by: r4
+    target: "alpha::helper"
+    candidates: null
+    note: >
+      `helper` is not project-unique (alpha AND beta both define it, see case
+      c), so without the `use crate::alpha::helper;` import this would fall
+      through to r6/AMBIGUOUS exactly like case c. The import is what
+      restricts the candidate set to one, distinguishing r4 from r5.
+
+  - case: bonus-r4-glob-import
+    defect: null
+    edge_type: calls
+    from: "gamma::dispatch_unique"
+    from_file: src/gamma.rs
+    to_name: unique_alpha_fn
+    to_type: function
+    confidence: RESOLVED
+    resolved_by: r4
+    target: "alpha::unique_alpha_fn"
+    candidates: null
+    note: >
+      Reached via `use crate::alpha::*;` (glob) rather than a named import —
+      confirms R4's "import facts" must include glob-imported paths, not
+      just explicitly-named ones.
+
+  - case: bonus-r2
+    defect: null
+    edge_type: calls
+    from: "delta::call_connect_via_module_import"
+    from_file: src/delta.rs
+    to_name: "connection::connect"
+    to_type: function
+    confidence: RESOLVED
+    resolved_by: r2
+    target: "db::connection::connect"
+    candidates: null
+    note: >
+      `use crate::db::connection;` brings the module (not the function) into
+      scope, so the call text is the two-segment suffix `connection::connect`
+      of the three-segment qualified_name `db::connection::connect` — not an
+      exact match (that's case b in main.rs, which resolves via r1 instead).
+
+# Derived file_ref cross-file cycles (D4's fix). "via" names the resolved
+# edge_type(s) whose RESOLVED instances produced the cycle.
+cycles:
+  - files: [src/even.rs, src/odd.rs]
+    via: calls

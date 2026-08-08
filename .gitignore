@@ -1,0 +1,7 @@
+/target
+.codegraph/
+.codegraph.stale-*/
+.DS_Store
+
+# surreal CLI scratch history
+history.txt

@@ -1,0 +1,50 @@
+# Top-level kill-test assertion for the rename-refactor fixture pair.
+# Schema documented in ../README.md ("Schema — the rename-refactor pair").
+#
+# This file doesn't restate the per-side ground truth (see before/expected.yaml
+# and after/expected.yaml for that) — it exists to make the DELTA between
+# them an explicit, checkable assertion, so R3b's test harness doesn't have
+# to hand-derive "what changed" by diffing the two manifests itself.
+fixture: rename-refactor
+description: >
+  before/ and after/ are two independent, independently-indexable fixture
+  projects (each with its own Cargo.toml + expected.yaml) representing a
+  single incomplete rename refactor: target::helper -> target::helper_v2.
+  updated_caller.rs was migrated to match; stale_caller.rs (byte-identical
+  in both trees) was not. This is the spec's "gate kill-test,
+  operationalized" (R3): the exact scenario a skeptical engineer will try
+  in the first two hours of using impact analysis on a real refactor.
+
+before: before/expected.yaml
+after: after/expected.yaml
+
+kill_test:
+  qualified_name_before: "target::helper"
+  qualified_name_after: "target::helper_v2"
+  callers:
+    - from: "stale_caller::use_stale"
+      from_file: src/stale_caller.rs
+      before: {confidence: RESOLVED, resolved_by: r1, target: "target::helper"}
+      after: {confidence: UNRESOLVED, resolved_by: r6, target: null}
+      must_flag: true
+      note: >
+        THE kill-test. This caller's source text is byte-identical in
+        before/ and after/ — the only thing that changed is that its call
+        target was renamed out from under it. impact()/deps() on `helper`
+        (equivalently: re-resolving after/ and diffing against before/)
+        MUST surface this RESOLVED -> UNRESOLVED transition. Silently
+        reporting zero dependents on the new name, or simply failing to
+        notice the caller went stale, is precisely the failure mode
+        red-team flagged as what a skeptical engineer will try first.
+    - from: "updated_caller::use_updated"
+      from_file: src/updated_caller.rs
+      before: {confidence: RESOLVED, resolved_by: r1, target: "target::helper"}
+      after: {confidence: RESOLVED, resolved_by: r1, target: "target::helper_v2"}
+      must_flag: false
+      note: >
+        Contrast case: correctly migrated, so a correct implementation
+        flags NOTHING here. Included so the kill-test proves the tool
+        distinguishes the one broken caller from a properly updated one,
+        rather than blanket-flagging every caller that ever mentioned the
+        old name (which would also "pass" a test that only checked for
+        stale_caller.rs in isolation, but for the wrong reason).

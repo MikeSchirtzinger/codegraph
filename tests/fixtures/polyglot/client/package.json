@@ -1,0 +1,11 @@
+{
+  "name": "fixture-polyglot-client",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}

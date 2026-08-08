@@ -1,0 +1,52 @@
+# Ground truth manifest for tests/fixtures/rename-refactor/after.
+# Schema documented in ../../README.md — read that first.
+fixture: rename-refactor/after
+language: rust
+root: tests/fixtures/rename-refactor/after
+description: >
+  Post-refactor state: target.rs now defines `helper_v2`. updated_caller.rs
+  was migrated to match; stale_caller.rs was not (byte-identical to
+  before/). Compare against ../before/expected.yaml and see ../expected.yaml
+  for the kill-test this pair encodes.
+
+nodes:
+  - {file: src/target.rs, name: helper_v2, node_type: function, qualified_name: "target::helper_v2"}
+  - {file: src/stale_caller.rs, name: use_stale, node_type: function, qualified_name: "stale_caller::use_stale"}
+  - {file: src/updated_caller.rs, name: use_updated, node_type: function, qualified_name: "updated_caller::use_updated"}
+  - {file: src/main.rs, name: main, node_type: function, qualified_name: main}
+
+edges:
+  - case: post-rename-stale-caller
+    defect: null
+    edge_type: calls
+    from: "stale_caller::use_stale"
+    from_file: src/stale_caller.rs
+    to_name: "target::helper"
+    to_type: function
+    confidence: UNRESOLVED
+    resolved_by: r6
+    target: null
+    candidates: []
+    note: >
+      THE kill-test. Same from/to_name as before/expected.yaml's
+      pre-rename-stale-caller entry (this file was never touched by the
+      refactor) — but target::helper no longer exists (only
+      target::helper_v2 does), so R1/R2 no longer match and this now
+      terminates R6 as UNRESOLVED instead of RESOLVED. A re-index of this
+      directory, or an `impact`/`deps` query on `helper`, MUST surface this
+      transition rather than silently reporting the caller as gone/fine.
+
+  - case: post-rename-updated-caller
+    defect: null
+    edge_type: calls
+    from: "updated_caller::use_updated"
+    from_file: src/updated_caller.rs
+    to_name: "target::helper_v2"
+    to_type: function
+    confidence: RESOLVED
+    resolved_by: r1
+    target: "target::helper_v2"
+    candidates: null
+    note: "Contrast case: correctly migrated, so nothing should be flagged here."
+
+cycles: []

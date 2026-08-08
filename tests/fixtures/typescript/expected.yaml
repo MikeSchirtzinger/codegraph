@@ -1,0 +1,111 @@
+# Ground truth manifest for tests/fixtures/typescript.
+# Schema documented in ../README.md — read that first.
+fixture: typescript
+language: typescript
+root: tests/fixtures/typescript
+description: >
+  Minimal TypeScript project exercising the resolver cascade and defects
+  D1-D4. alpha.ts/beta.ts/gamma.ts are deliberately script-mode (no
+  import/export) to make the D3 collision arise in code that actually runs.
+  even.ts/odd.ts mutually recurse via named (bare-call) imports, so that
+  cycle resolves via R5 rather than R1 — see "Contract interpretations"
+  below.
+
+# Ground truth for qualified_name computation (R0's accept criterion).
+# Convention: full relative file path from the fixture root (including
+# `src`; TypeScript gets no crate-root-style elision), extension stripped,
+# `/` normalized to `::`, then item name. No class nesting in this fixture.
+nodes:
+  - {file: src/main.ts, name: logStartup, node_type: function, qualified_name: "src::main::logStartup"}
+  - {file: src/main.ts, name: run, node_type: function, qualified_name: "src::main::run"}
+  - {file: src/alpha.ts, name: helper, node_type: function, qualified_name: "src::alpha::helper"}
+  - {file: src/beta.ts, name: helper, node_type: function, qualified_name: "src::beta::helper"}
+  - {file: src/gamma.ts, name: dispatch, node_type: function, qualified_name: "src::gamma::dispatch"}
+  - {file: src/db/connection.ts, name: connect, node_type: function, qualified_name: "src::db::connection::connect"}
+  - {file: src/even.ts, name: isEven, node_type: function, qualified_name: "src::even::isEven"}
+  - {file: src/odd.ts, name: isOdd, node_type: function, qualified_name: "src::odd::isOdd"}
+
+# Ground truth for the resolver cascade (R1's accept criterion). Field
+# semantics documented once in ../README.md.
+edges:
+  - case: a
+    defect: D1
+    edge_type: calls
+    from: "src::main::run"
+    from_file: src/main.ts
+    to_name: logStartup
+    to_type: function
+    confidence: RESOLVED
+    resolved_by: r3
+    target: "src::main::logStartup"
+    candidates: null
+
+  - case: b
+    defect: D2
+    edge_type: calls
+    from: "src::main::run"
+    from_file: src/main.ts
+    to_name: "connection.connect"
+    to_type: function
+    confidence: RESOLVED
+    resolved_by: r2
+    target: "src::db::connection::connect"
+    candidates: null
+
+  - case: e
+    defect: null
+    edge_type: calls
+    from: "src::main::run"
+    from_file: src/main.ts
+    to_name: "JSON.stringify"
+    to_type: function
+    confidence: UNRESOLVED
+    resolved_by: r6
+    target: null
+    candidates: []
+
+  - case: c
+    defect: D3
+    edge_type: calls
+    from: "src::gamma::dispatch"
+    from_file: src/gamma.ts
+    to_name: helper
+    to_type: function
+    confidence: AMBIGUOUS
+    resolved_by: r6
+    target: null
+    candidates: ["src::alpha::helper", "src::beta::helper"]
+
+  - case: d-cycle-even
+    defect: D4
+    edge_type: calls
+    from: "src::even::isEven"
+    from_file: src/even.ts
+    to_name: isOdd
+    to_type: function
+    confidence: RESOLVED
+    resolved_by: r5
+    target: "src::odd::isOdd"
+    candidates: null
+    note: >
+      `isOdd` is a bare identifier (named import, not a namespace import), so
+      R1/R2 (which require a qualified/multi-segment to_name) never apply;
+      R4 doesn't consult TypeScript import facts in v1 (Rust-only slot); R5
+      (project-unique bare name) is the first rule that actually resolves it.
+
+  - case: d-cycle-odd
+    defect: D4
+    edge_type: calls
+    from: "src::odd::isOdd"
+    from_file: src/odd.ts
+    to_name: isEven
+    to_type: function
+    confidence: RESOLVED
+    resolved_by: r5
+    target: "src::even::isEven"
+    candidates: null
+
+# Derived file_ref cross-file cycles (D4's fix).
+cycles:
+  - files: [src/even.ts, src/odd.ts]
+    via: calls

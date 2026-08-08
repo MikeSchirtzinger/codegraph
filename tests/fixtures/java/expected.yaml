@@ -1,0 +1,142 @@
+# Ground truth manifest for tests/fixtures/java.
+# Schema documented in ../README.md — read that first.
+fixture: java
+language: java
+root: tests/fixtures/java
+description: >
+  Minimal Maven-layout Java project exercising the resolver cascade and
+  defects D1-D4. Gamma.java statically imports Alpha.helper and Beta.helper
+  under the same unqualified name (case c, D3). Even.java/Odd.java mutually
+  recurse via static imports (bare calls), so that cycle resolves via R5
+  rather than R1. Case b originally assumed a small java.rs extractor
+  enhancement that, as of 2026-07-10, has been implemented, diffed against
+  this manifest, and briefly mis-synced and then corrected back — see case
+  b's note for the full audit trail; net effect vs. the original R3a
+  submission is just resolved_by r1 -> r2 (to_name and target unchanged).
+
+# Ground truth for qualified_name computation (R0's accept criterion).
+# Convention: STRICTLY MECHANICAL, no Maven/Gradle convention stripping —
+# orchestrator ruling 2026-07-10 (see ../README.md "Contract
+# interpretations" #3). The full relative file path (directory only, file
+# basename dropped — Java's module unit is the package/directory, same as
+# Go) is kept as-is, including the `src/main/java/` standard-layout
+# segments, then the containing class, then the method name.
+nodes:
+  - {file: src/main/java/com/example/Main.java, name: logStartup, node_type: function, qualified_name: "src::main::java::com::example::Main::logStartup"}
+  - {file: src/main/java/com/example/Main.java, name: run, node_type: function, qualified_name: "src::main::java::com::example::Main::run"}
+  - {file: src/main/java/com/example/Main.java, name: main, node_type: function, qualified_name: "src::main::java::com::example::Main::main"}
+  - {file: src/main/java/com/example/Gamma.java, name: dispatch, node_type: function, qualified_name: "src::main::java::com::example::Gamma::dispatch"}
+  - {file: src/main/java/com/example/alpha/Alpha.java, name: helper, node_type: function, qualified_name: "src::main::java::com::example::alpha::Alpha::helper"}
+  - {file: src/main/java/com/example/beta/Beta.java, name: helper, node_type: function, qualified_name: "src::main::java::com::example::beta::Beta::helper"}
+  - {file: src/main/java/com/example/db/Db.java, name: connect, node_type: function, qualified_name: "src::main::java::com::example::db::Db::connect"}
+  - {file: src/main/java/com/example/evenodd/Even.java, name: isEven, node_type: function, qualified_name: "src::main::java::com::example::evenodd::Even::isEven"}
+  - {file: src/main/java/com/example/evenodd/Odd.java, name: isOdd, node_type: function, qualified_name: "src::main::java::com::example::evenodd::Odd::isOdd"}
+
+# Ground truth for the resolver cascade (R1's accept criterion). Field
+# semantics documented once in ../README.md.
+edges:
+  - case: a
+    defect: D1
+    edge_type: calls
+    from: "src::main::java::com::example::Main::run"
+    from_file: src/main/java/com/example/Main.java
+    to_name: logStartup
+    to_type: function
+    confidence: RESOLVED
+    resolved_by: r3
+    target: "src::main::java::com::example::Main::logStartup"
+    candidates: null
+
+  - case: b
+    defect: D2
+    edge_type: calls
+    from: "src::main::java::com::example::Main::run"
+    from_file: src/main/java/com/example/Main.java
+    to_name: "com.example.db.Db.connect"
+    to_type: function
+    confidence: RESOLVED
+    resolved_by: r2
+    target: "src::main::java::com::example::db::Db::connect"
+    candidates: null
+    note: >
+      Source calls this fully qualified (`com.example.db.Db.connect()`),
+      and the implemented java.rs fix (java.rs:214-223,
+      `ctx.node_text(object_node)`) captures that whole object-expression
+      text verbatim, consistent with every other extractor's generic
+      "function field" capture — so to_name is the full five-segment
+      "com.example.db.Db.connect", a SUFFIX of the eight-segment
+      qualified_name (`src::main::java::` is build-layout boilerplate no
+      real Java source ever writes), not an exact match — hence r2, not r1.
+      CORRECTION HISTORY (audit trail): this manifest originally had
+      to_name="com.example.db.Db.connect" + r1 (wrong rule, right string) →
+      was changed 2026-07-10 to to_name="Db.connect" + r2 on a relayed
+      claim that the fix captures only the immediate qualifier (wrong
+      string, right rule, but for the wrong reason) → reverted the SAME day
+      once R3b's string-strict harness and a direct read of java.rs:214-223
+      confirmed the object field's FULL text is what's captured. Net
+      result: r2 was right all along, to_name is back to the original.
+      confidence/target were correct throughout every version.
+
+  - case: e
+    defect: null
+    edge_type: calls
+    from: "src::main::java::com::example::Main::run"
+    from_file: src/main/java/com/example/Main.java
+    to_name: "System.getenv"
+    to_type: function
+    confidence: UNRESOLVED
+    resolved_by: r6
+    target: null
+    candidates: []
+    note: >
+      Unaffected by case b's to_name churn (see its note): the object field
+      is captured verbatim regardless, and `System.getenv` was correct
+      under every version of that analysis. UNRESOLVED simply because
+      nothing named getenv exists in this project.
+
+  - case: c
+    defect: D3
+    edge_type: calls
+    from: "src::main::java::com::example::Gamma::dispatch"
+    from_file: src/main/java/com/example/Gamma.java
+    to_name: helper
+    to_type: function
+    confidence: AMBIGUOUS
+    resolved_by: r6
+    target: null
+    candidates: ["src::main::java::com::example::alpha::Alpha::helper", "src::main::java::com::example::beta::Beta::helper"]
+
+  - case: d-cycle-even
+    defect: D4
+    edge_type: calls
+    from: "src::main::java::com::example::evenodd::Even::isEven"
+    from_file: src/main/java/com/example/evenodd/Even.java
+    to_name: isOdd
+    to_type: function
+    confidence: RESOLVED
+    resolved_by: r5
+    target: "src::main::java::com::example::evenodd::Odd::isOdd"
+    candidates: null
+    note: >
+      `isOdd` is a bare identifier (static import, not a qualified
+      `Odd.isOdd(...)` call), so R1/R2 never apply; R4 doesn't consult Java
+      import facts in v1 (Rust-only slot); R5 (project-unique bare name) is
+      the first rule that resolves it. Unaffected by the object-field
+      caveat above since there's no object field on a bare call.
+
+  - case: d-cycle-odd
+    defect: D4
+    edge_type: calls
+    from: "src::main::java::com::example::evenodd::Odd::isOdd"
+    from_file: src/main/java/com/example/evenodd/Odd.java
+    to_name: isEven
+    to_type: function
+    confidence: RESOLVED
+    resolved_by: r5
+    target: "src::main::java::com::example::evenodd::Even::isEven"
+    candidates: null
+
+# Derived file_ref cross-file cycles (D4's fix).
+cycles:
+  - files: [src/main/java/com/example/evenodd/Even.java, src/main/java/com/example/evenodd/Odd.java]
+    via: calls

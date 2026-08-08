@@ -1,0 +1,134 @@
+# Ground truth manifest for tests/fixtures/polyglot.
+# Schema documented in ../README.md — read that first.
+fixture: polyglot
+language: polyglot
+root: tests/fixtures/polyglot
+description: >
+  Small repo mixing Python (api/), Go (worker/), and TypeScript (client/) in
+  one project_id. The per-language fixtures each cover the full cascade in
+  isolation; this one exists specifically to test the boundary BETWEEN
+  languages within a single indexed project — most importantly, that a bare
+  name collision across two different languages (api/app.py's `connect` and
+  worker/main.go's `connect`) does not get treated as a same-project
+  ambiguity, because no call syntax in any of these 6 languages can ever
+  cross a language boundary. See case c and "Contract interpretations"
+  below.
+
+# Ground truth for qualified_name computation. Each language sub-tree uses
+# its own per-language convention exactly as documented in the sibling
+# fixtures' READMEs/manifests (TypeScript and Python: file-basename-
+# inclusive, no elision; Go: directory-only) — the only difference from a
+# single-language fixture is that paths are relative to THIS project's
+# root, so e.g. worker/main.go's directory segment is "worker", not empty.
+nodes:
+  - {file: api/app.py, name: connect, node_type: function, qualified_name: "api::app::connect"}
+  - {file: api/consumer.py, name: run, node_type: function, qualified_name: "api::consumer::run"}
+  - {file: worker/main.go, name: connect, node_type: function, qualified_name: "worker::connect"}
+  - {file: worker/main.go, name: Run, node_type: function, qualified_name: "worker::Run"}
+  - {file: worker/main.go, name: main, node_type: function, qualified_name: "worker::main"}
+  - {file: client/src/format.ts, name: toJson, node_type: function, qualified_name: "client::src::format::toJson"}
+  - {file: client/src/index.ts, name: logStartup, node_type: function, qualified_name: "client::src::index::logStartup"}
+  - {file: client/src/index.ts, name: run, node_type: function, qualified_name: "client::src::index::run"}
+  - {file: client/src/even.ts, name: isEven, node_type: function, qualified_name: "client::src::even::isEven"}
+  - {file: client/src/odd.ts, name: isOdd, node_type: function, qualified_name: "client::src::odd::isOdd"}
+
+# Ground truth for the resolver cascade. Field semantics documented once in
+# ../README.md.
+edges:
+  - case: a-go
+    defect: D1
+    edge_type: calls
+    from: "worker::Run"
+    from_file: worker/main.go
+    to_name: connect
+    to_type: function
+    confidence: RESOLVED
+    resolved_by: r3
+    target: "worker::connect"
+    candidates: null
+    note: >
+      Same-file match — correct regardless of language-scoping (R3 doesn't
+      need it), included mainly to show D1 holds inside the polyglot
+      project too.
+
+  - case: c-cross-language
+    defect: D3
+    edge_type: calls
+    from: "api::consumer::run"
+    from_file: api/consumer.py
+    to_name: connect
+    to_type: function
+    confidence: RESOLVED
+    resolved_by: r5
+    target: "api::app::connect"
+    candidates: null
+    note: >
+      THE headline case for this fixture. `connect` (name, to_type=function)
+      exists TWICE project-wide across the whole polyglot repo:
+      api::app::connect (Python) and worker::connect (Go). A resolver whose
+      R5 candidate search is not scoped to the calling edge's own language
+      would see 2 project-wide candidates here, fail "exactly one", and
+      incorrectly fall through to R6/AMBIGUOUS with candidates
+      ["api::app::connect", "worker::connect"] — a Python call landing on a
+      Go function is structurally impossible (no FFI syntax modeled), so
+      that would be wrong. Candidates MUST be scoped to nodes reachable
+      from the calling edge's own language for R5 (and every other rule) to
+      behave sanely in a multi-language project; see "Contract
+      interpretations" in ../README.md. Expected/correct result: RESOLVED
+      via r5, unique WITHIN PYTHON. (Node/edge qualified_names corrected
+      2026-07-10: the `api::` directory prefix was missing on the Python
+      side — R3b's string-strict harness caught it; Go's `worker::` prefix
+      was already correct.)
+
+  - case: b
+    defect: D2
+    edge_type: calls
+    from: "client::src::index::run"
+    from_file: client/src/index.ts
+    to_name: "format.toJson"
+    to_type: function
+    confidence: RESOLVED
+    resolved_by: r2
+    target: "client::src::format::toJson"
+    candidates: null
+
+  - case: e
+    defect: null
+    edge_type: calls
+    from: "client::src::index::run"
+    from_file: client/src/index.ts
+    to_name: "Math.max"
+    to_type: function
+    confidence: UNRESOLVED
+    resolved_by: r6
+    target: null
+    candidates: []
+
+  - case: d-cycle-even
+    defect: D4
+    edge_type: calls
+    from: "client::src::even::isEven"
+    from_file: client/src/even.ts
+    to_name: isOdd
+    to_type: function
+    confidence: RESOLVED
+    resolved_by: r5
+    target: "client::src::odd::isOdd"
+    candidates: null
+
+  - case: d-cycle-odd
+    defect: D4
+    edge_type: calls
+    from: "client::src::odd::isOdd"
+    from_file: client/src/odd.ts
+    to_name: isEven
+    to_type: function
+    confidence: RESOLVED
+    resolved_by: r5
+    target: "client::src::even::isEven"
+    candidates: null
+
+# Derived file_ref cross-file cycles (D4's fix).
+cycles:
+  - files: [client/src/even.ts, client/src/odd.ts]
+    via: calls

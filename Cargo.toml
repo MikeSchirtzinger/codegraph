@@ -1,0 +1,55 @@
+[package]
+name = "codegraph"
+version = "0.1.0"
+edition = "2021"
+description = "Structural code graph with a resolver that never guesses: typed edges, disclosed three-valued confidence, and a rename gate whose false-positive rate is the product"
+license = "MIT"
+repository = "https://github.com/MikeSchirtzinger/codegraph"
+keywords = ["code-analysis", "tree-sitter", "graph", "static-analysis"]
+categories = ["development-tools"]
+
+[[bin]]
+name = "codegraph"
+path = "src/main.rs"
+
+[lib]
+name = "codegraph"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.4", features = ["derive", "env"] }
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Pinned EXACTLY to 3.0.1: surrealkv on-disk formats are incompatible across
+# 3.0.1 <-> 3.2.0 ("Invalid revision" on open). A caret "3.0" let a stray
+# `cargo update` silently bump to a format-breaking release. Do not loosen
+# without an on-disk migration plan for existing .codegraph stores.
+surrealdb = { version = "=3.0.1", features = ["kv-surrealkv", "kv-mem", "protocol-ws", "protocol-http"] }
+surrealdb-types = "=3.0.1"
+regex = "1.10"
+tokio = { version = "1.41", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+walkdir = "2"
+sha2 = "0.10"
+hex = "0.4"
+uuid = { version = "1.11", features = ["v4", "v5", "serde"] }
+rmcp = { version = "1.5", features = ["server", "transport-io"] }
+schemars = "1.0"
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-go = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-c = "0.23"
+tree-sitter-cpp = "0.23"
+
+[dev-dependencies]
+tempfile = "3.8"
+# R3b: deserializes tests/fixtures/**/expected.yaml manifests for the
+# integration-test harness (tests/common/mod.rs). Single justified exception
+# to the no-Cargo.toml-churn rule — see DEVIATIONS in the R3b report.
+serde_yaml = "0.9"

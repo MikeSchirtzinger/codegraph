@@ -1,0 +1,13 @@
+# These fixtures are indexed as source text (tree-sitter), never actually
+# built as part of the normal test suite — but they're valid, idiomatic
+# projects in their respective languages (see README.md "Validation
+# performed"), so anyone spot-checking one with the real toolchain will
+# generate the usual byproducts. Keep them out of the fixture data.
+Cargo.lock
+/target
+__pycache__/
+*.pyc
+node_modules/
+dist/
+*.class
+*.o
