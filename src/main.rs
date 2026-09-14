@@ -1,15 +1,20 @@
-mod canon;
-mod cli;
-mod context;
-mod db;
-mod graph;
-mod index;
-mod mcp;
-mod stats;
+//! The `codegraph` binary: argument parsing, dispatch, and printing.
+//!
+//! It declares no modules of its own. Everything it calls lives in the
+//! library crate and is reached through `use codegraph::…`, so the module
+//! tree is compiled exactly once and `crate::` means the library in every
+//! file that is part of it. See `src/lib.rs` for what went wrong when this
+//! file re-declared the tree instead.
+
+use std::io::Write;
+use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
-use cli::{Cli, Commands};
+
+use codegraph::cli::{Cli, Commands, PlanCmd};
+use codegraph::plan::ops;
+use codegraph::{config, context, db, graph, index, mcp, stats};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -39,10 +44,12 @@ async fn main() -> Result<()> {
             force,
             db_url,
         } => {
-            let client = db::connect(db_url.as_deref()).await?;
+            let root = config::repo_root(&path);
+            let project_id = config::project_id(project_id.as_deref(), Some(&path))?;
+            let client = db::connect(Some(&config::db_url(db_url.as_deref(), &root)?)).await?;
             db::init_schema(&client).await?;
 
-            let tier: index::IndexingTier = tier.parse()?;
+            let tier: index::IndexingTier = config::tier(tier.as_deref(), &root)?.parse()?;
 
             let config = index::IndexConfig {
                 project_id: project_id.clone(),
@@ -56,6 +63,9 @@ async fn main() -> Result<()> {
 
             println!("\n=== Indexing Complete ===");
             println!("  Project:     {project_id}");
+            println!("  Tier:        {}", tier.as_str());
+            println!("  Discovery:   {}", result.discovery.describe());
+            println!("  Elapsed:     {:.1}s", result.elapsed.as_secs_f64());
             println!(
                 "  Files:       {} scanned, {} indexed, {} unchanged, {} skipped",
                 result.files_scanned,
@@ -98,7 +108,8 @@ async fn main() -> Result<()> {
         }
 
         Commands::Resolve { project_id, db_url } => {
-            let client = db::connect(db_url.as_deref()).await?;
+            let project_id = config::project_id(project_id.as_deref(), None)?;
+            let client = db::connect(Some(&store_url(db_url.as_deref())?)).await?;
             db::init_schema(&client).await?;
 
             let stats = index::resolve::resolve_project(&client, &project_id).await?;
@@ -124,17 +135,20 @@ async fn main() -> Result<()> {
             project_id,
             db_url,
         } => {
-            let client = db::connect(db_url.as_deref()).await?;
+            let project_id = config::project_id(project_id.as_deref(), None)?;
+            let client = db::connect(Some(&store_url(db_url.as_deref())?)).await?;
             context::generate_context(&client, &project_id, &output).await?;
         }
 
         Commands::Stats { project_id, db_url } => {
-            let client = db::connect(db_url.as_deref()).await?;
+            let project_id = config::project_id(project_id.as_deref(), None)?;
+            let client = db::connect(Some(&store_url(db_url.as_deref())?)).await?;
             stats::print_stats(&client, &project_id).await?;
         }
 
         Commands::Serve { project_id, db_url } => {
-            let client = db::connect(db_url.as_deref()).await?;
+            let project_id = config::project_id(project_id.as_deref(), None)?;
+            let client = db::connect(Some(&store_url(db_url.as_deref())?)).await?;
             mcp::server::serve_stdio(client, project_id).await?;
         }
 
@@ -144,8 +158,9 @@ async fn main() -> Result<()> {
             json,
             db_url,
         } => {
-            let client = db::connect(db_url.as_deref()).await?;
-            // Idempotent DDL, same as Query — a store that was never
+            let project_id = config::project_id(project_id.as_deref(), None)?;
+            let client = db::connect(Some(&store_url(db_url.as_deref())?)).await?;
+            // Idempotent DDL, same as Query. A store that was never
             // indexed answers with zero groups instead of a table error.
             db::init_schema(&client).await?;
 
@@ -161,14 +176,14 @@ async fn main() -> Result<()> {
                 );
                 for g in &groups {
                     println!(
-                        "Group of {} — fingerprint {} ({}-edge neighborhood):",
+                        "Group of {}, fingerprint {} ({}-edge neighborhood):",
                         g.members.len(),
                         g.fingerprint,
                         g.edge_count
                     );
                     for m in &g.members {
                         println!(
-                            "  {} ({}) — {}:{}",
+                            "  {} ({}), {}:{}",
                             m.qualified_name,
                             m.node_type,
                             m.file_path,
@@ -187,11 +202,19 @@ async fn main() -> Result<()> {
             limit,
             depth,
             include_ambiguous,
+            explain,
             json,
             db_url,
         } => {
-            let client = db::connect(db_url.as_deref()).await?;
-            // Idempotent DDL, same as Index/Resolve run on connect — without
+            // Four query kinds take a name and have no meaning without one.
+            // Leaving `--name` optional for them meant a forgotten flag
+            // exited 0 with "No function named '' found", which reads as a
+            // fact about the codebase rather than a fact about the command
+            // line. Refuse before opening the store.
+            let name = require_name(&kind, name)?;
+            let project_id = config::project_id(project_id.as_deref(), None)?;
+            let client = db::connect(Some(&store_url(db_url.as_deref())?)).await?;
+            // Idempotent DDL, same as Index/Resolve run on connect. Without
             // it, `query` against a store that was created but never
             // indexed (SCHEMAFULL `code_node` undefined) hard-errors on
             // "table does not exist" instead of the graceful "zero results" /
@@ -228,7 +251,7 @@ async fn main() -> Result<()> {
                         println!("=== Hub Nodes (top {limit}) ===\n");
                         for h in &hubs {
                             println!(
-                                "  {} ({}) — in:{} out:{} total:{} — {}",
+                                "  {} ({}): in:{} out:{} total:{}, {}",
                                 h.name,
                                 h.node_type,
                                 h.in_degree,
@@ -266,7 +289,7 @@ async fn main() -> Result<()> {
                         println!("=== Search: '{q}' ({} results) ===\n", results.len());
                         for n in &results {
                             println!(
-                                "  {} ({}) — {}:{}",
+                                "  {} ({}), {}:{}",
                                 n.name,
                                 n.node_type,
                                 n.file_path,
@@ -294,7 +317,7 @@ async fn main() -> Result<()> {
                         } else {
                             if result.name_ambiguous {
                                 println!(
-                                    "'{fname}' matches {} distinct functions — showing each separately:\n",
+                                    "'{fname}' matches {} distinct functions, showing each separately:\n",
                                     result.groups.len()
                                 );
                             }
@@ -313,7 +336,7 @@ async fn main() -> Result<()> {
                                     for a in &g.ambiguous {
                                         let indent = "  ".repeat(a.depth);
                                         println!(
-                                            "{indent}{} → [AMBIGUOUS] '{}' ({}) — candidates: {}",
+                                            "{indent}{} → [AMBIGUOUS] '{}' ({}), candidates: {}",
                                             a.caller_name,
                                             a.to_name,
                                             a.to_type,
@@ -349,7 +372,7 @@ async fn main() -> Result<()> {
                         // lib crate's copy, not main.rs's own private `mod
                         // graph;`) so the result is the same
                         // `DependencyResult` type `codegraph::facade`'s
-                        // projection expects — reusing `client`, the
+                        // projection expects, reusing `client`, the
                         // connection already open above, rather than a
                         // second `facade::open_store`: a second connection
                         // to the same embedded surrealkv store while
@@ -370,12 +393,26 @@ async fn main() -> Result<()> {
                         let graph_empty = !codegraph::facade::is_indexed_conn(&client, &project_id)
                             .await
                             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                        let verdict = codegraph::facade::project_dependency_result(
+                        let mut verdict = codegraph::facade::project_dependency_result(
                             codegraph::facade::VerdictTarget::Symbol(sname.to_string()),
                             sname,
                             &dep_result,
                             graph_empty,
                         );
+                        // `explanations` stays absent unless asked for, so
+                        // the bytes of a plain verdict are what they were
+                        // before the field existed.
+                        if explain {
+                            verdict.explanations = Some(
+                                codegraph::facade::explain_chains_for_symbol(
+                                    &client,
+                                    &project_id,
+                                    sname,
+                                )
+                                .await
+                                .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+                            );
+                        }
                         println!("{}", serde_json::to_string(&verdict)?);
                     } else {
                         let result = graph::dependencies::get_reverse_dependencies(
@@ -411,6 +448,20 @@ async fn main() -> Result<()> {
                                 );
                             }
                         }
+                        if explain {
+                            let chains = codegraph::facade::explain_chains_for_symbol(
+                                &client,
+                                &project_id,
+                                sname,
+                            )
+                            .await
+                            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                            println!("\n=== Evidence ({} chain(s)) ===\n", chains.len());
+                            for chain in &chains {
+                                print!("{}", chain.render());
+                                println!();
+                            }
+                        }
                     }
                 }
                 "circular" => {
@@ -437,12 +488,189 @@ async fn main() -> Result<()> {
                 }
             }
         }
+
+        Commands::Init {
+            path,
+            project_id,
+            force,
+            json,
+        } => {
+            let start = match path {
+                Some(p) => p,
+                None => std::env::current_dir()?,
+            };
+            let root = config::repo_root(&start);
+            let project_id = config::project_id(project_id.as_deref(), Some(root.as_path()))?;
+            let options = codegraph::init::InitOptions {
+                root,
+                project_id,
+                force,
+            };
+            emit(&codegraph::init::run(&options)?, json)?;
+        }
+
+        Commands::Doctor {
+            project_id,
+            db_url,
+            json,
+        } => {
+            let root = config::repo_root(&std::env::current_dir()?);
+            let resolved =
+                config::resolve_project_id(project_id.as_deref(), Some(root.as_path()))?;
+            let options = codegraph::doctor::DoctorOptions {
+                project_id: resolved.id,
+                project_id_source: resolved.source.describe(),
+                root,
+                db_url,
+            };
+            let report = codegraph::doctor::run(&options).await?;
+            emit(&report, json)?;
+            // A doctor that found something broken has to say so in the exit
+            // code too, or no script can act on it. A warning is still a
+            // healthy exit.
+            if !report.is_healthy() {
+                std::io::stdout().flush().ok();
+                std::process::exit(1);
+            }
+        }
+
+        Commands::Plan {
+            cmd,
+            project_id,
+            db_url,
+            planes_file,
+            json,
+        } => {
+            let root = config::repo_root(&std::env::current_dir()?);
+            let planes_path: PathBuf =
+                planes_file.unwrap_or_else(|| codegraph::plan::default_planes_path(&root));
+
+            // `lint` reads the planes file and nothing else, so it runs
+            // before any connection is opened. That is what lets it work on
+            // a repo that has never been indexed, which is exactly when a
+            // malformed planes file is most likely.
+            if matches!(cmd, PlanCmd::Lint) {
+                emit(&ops::lint(&planes_path)?, json)?;
+                return Ok(());
+            }
+
+            let project_id = config::project_id(project_id.as_deref(), Some(root.as_path()))?;
+            let client = db::connect(Some(&store_url(db_url.as_deref())?)).await?;
+            db::init_schema(&client).await?;
+
+            match cmd {
+                PlanCmd::Sync => {
+                    emit(&ops::sync(&client, &project_id, &planes_path).await?, json)?
+                }
+                PlanCmd::List {
+                    plane,
+                    status,
+                    horizon,
+                } => {
+                    let filter = ops::ListFilter {
+                        plane,
+                        status,
+                        horizon,
+                    };
+                    emit(&ops::list(&client, &project_id, &filter).await?, json)?
+                }
+                PlanCmd::Show { id } => emit(&ops::show(&client, &project_id, &id).await?, json)?,
+                PlanCmd::Touching { target } => {
+                    emit(&ops::touching(&client, &project_id, &target).await?, json)?
+                }
+                PlanCmd::Collisions => emit(&ops::collisions(&client, &project_id).await?, json)?,
+                PlanCmd::Stale => emit(&ops::stale(&client, &project_id).await?, json)?,
+                PlanCmd::Blast { id, depth } => {
+                    emit(&ops::blast(&client, &project_id, &id, depth).await?, json)?
+                }
+                PlanCmd::Brief => {
+                    let markdown = codegraph::landscape::brief(&client, &project_id).await?;
+                    if json {
+                        println!("{}", serde_json::to_string(&markdown)?);
+                    } else {
+                        print!("{markdown}");
+                    }
+                }
+                PlanCmd::Lint => unreachable!("lint runs above, before the store is opened"),
+            }
+        }
+
+        Commands::Landscape {
+            project_id,
+            format,
+            output,
+            db_url,
+        } => {
+            let project_id = config::project_id(project_id.as_deref(), None)?;
+            let client = db::connect(Some(&store_url(db_url.as_deref())?)).await?;
+            db::init_schema(&client).await?;
+
+            let options = codegraph::landscape::LandscapeOptions {
+                project_id,
+                format,
+                output,
+            };
+            let rendered = codegraph::landscape::run(&client, &options).await?;
+            match &rendered.written_to {
+                Some(path) => println!("Landscape written to {}", path.display()),
+                None => print!("{}", rendered.rendered),
+            }
+        }
     }
 
     Ok(())
 }
 
-/// Shared printer for `deps`/`rdeps` — both return the same grouped
+/// The store url for a command run from the current directory.
+///
+/// Anchored at the repo root by [`config::db_url`], so `codegraph query`
+/// typed inside `src/` reads the same store `codegraph index` typed at the
+/// root wrote, instead of silently creating an empty second one.
+fn store_url(explicit: Option<&str>) -> Result<String> {
+    let root = config::repo_root(&std::env::current_dir()?);
+    config::db_url(explicit, &root)
+}
+
+/// Query kinds whose whole meaning is the name they are given.
+const NAME_REQUIRED_KINDS: [&str; 4] = ["calls", "deps", "rdeps", "search"];
+
+/// Reject a name-taking query kind that was given no name.
+///
+/// The old behavior was worse than an error: an empty name flowed into the
+/// lookup, matched nothing, and printed "No function named '' found" with a
+/// zero exit code. A caller reading that learns something false about their
+/// codebase. The message names the flag and shows the command, because the
+/// user already knows what they meant.
+fn require_name(kind: &str, name: Option<String>) -> Result<Option<String>> {
+    if !NAME_REQUIRED_KINDS.contains(&kind) {
+        return Ok(name);
+    }
+    match name.as_deref().map(str::trim) {
+        Some(n) if !n.is_empty() => Ok(name),
+        _ => anyhow::bail!(
+            "--kind {kind} needs a symbol to work on. Pass one with --name:\n  codegraph query --kind {kind} --name <symbol>"
+        ),
+    }
+}
+
+/// Print one command result: machine-readable JSON on `--json`, the value's
+/// own human rendering otherwise.
+///
+/// Every result type the new subcommands return carries both a `Serialize`
+/// and a `Display` impl, and this is the only thing `main.rs` ever does with
+/// them. That is deliberate: `src/main.rs` is owned by one lane and the
+/// modules it dispatches into are owned by others, so the dispatch never
+/// reads a field it does not own.
+fn emit<T: serde::Serialize + std::fmt::Display>(value: &T, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(value)?);
+    } else {
+        print!("{value}");
+    }
+    Ok(())
+}
+
+/// Shared printer for `deps`/`rdeps`. Both return the same grouped
 /// `DependencyResult` shape (R2: uniform consumption of the resolved
 /// graph), so both render the same way: per-symbol groups (only labeled
 /// when the queried name was itself ambiguous, D3), each with its resolved
@@ -463,7 +691,7 @@ fn print_dependency_result(
     }
     if result.name_ambiguous {
         println!(
-            "'{name}' matches {} distinct symbols — showing each separately:\n",
+            "'{name}' matches {} distinct symbols, showing each separately:\n",
             result.groups.len()
         );
     }
@@ -473,7 +701,7 @@ fn print_dependency_result(
         }
         for d in &g.items {
             let indent = "  ".repeat(d.depth);
-            println!("{indent}{} ({}) — {}", d.name, d.node_type, d.file_path);
+            println!("{indent}{} ({}), {}", d.name, d.node_type, d.file_path);
         }
         for u in &g.unresolved {
             let indent = "  ".repeat(u.depth);
@@ -483,7 +711,7 @@ fn print_dependency_result(
             for a in &g.ambiguous {
                 let indent = "  ".repeat(a.depth);
                 println!(
-                    "{indent}{} → [AMBIGUOUS] '{}' ({}) — candidates: {}",
+                    "{indent}{} → [AMBIGUOUS] '{}' ({}), candidates: {}",
                     a.from_name,
                     a.to_name,
                     a.to_type,

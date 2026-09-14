@@ -22,6 +22,10 @@ clap = { version = "4.4", features = ["derive", "env"] }
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Parses .codegraph/planes.yaml (src/plan/schema.rs) and the
+# tests/fixtures/**/expected.yaml manifests. Promoted from a dev-dependency at
+# this exact version, so it adds no new crate and no new lock file entry.
+serde_yaml = "0.9"
 # Pinned EXACTLY to 3.0.1: surrealkv on-disk formats are incompatible across
 # 3.0.1 <-> 3.2.0 ("Invalid revision" on open). A caret "3.0" let a stray
 # `cargo update` silently bump to a format-breaking release. Do not loosen
@@ -49,7 +53,3 @@ tree-sitter-cpp = "0.23"
 
 [dev-dependencies]
 tempfile = "3.8"
-# R3b: deserializes tests/fixtures/**/expected.yaml manifests for the
-# integration-test harness (tests/common/mod.rs). Single justified exception
-# to the no-Cargo.toml-churn rule — see DEVIATIONS in the R3b report.
-serde_yaml = "0.9"

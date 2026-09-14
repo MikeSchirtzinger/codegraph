@@ -78,6 +78,29 @@ pub async fn index_fixture(
     index_project(db, &config).await
 }
 
+/// [`index_fixture`] at a caller-chosen tier.
+///
+/// Exists for `tests/mcp_tools.rs`, which compares MCP responses byte for
+/// byte against output captured from the `codegraph` binary. The CLI's
+/// `index` defaults to `--tier full` (`src/cli.rs`), so a test comparing
+/// against a CLI-produced capture has to index at `full` too: `Balanced`
+/// omits the reference pass and would be comparing two different graphs.
+pub async fn index_fixture_tier(
+    db: &Arc<Surreal<Any>>,
+    project_id: &str,
+    root_relative: &str,
+    tier: IndexingTier,
+) -> Result<IndexResult> {
+    let config = IndexConfig {
+        project_id: project_id.to_string(),
+        root_path: repo_path(root_relative),
+        tier,
+        languages: None,
+        force: true,
+    };
+    index_project(db, &config).await
+}
+
 // ============================================================================
 // expected.yaml manifest schema (see tests/fixtures/README.md)
 // ============================================================================
@@ -234,6 +257,13 @@ pub struct DbEdge {
     pub confidence: String,
     pub resolved_by: String,
     pub candidates: Vec<String>,
+    /// Every cascade rule the resolver actually reached for this edge, in
+    /// order — the derivation `resolved_by` alone cannot carry, since on an
+    /// UNRESOLVED or AMBIGUOUS edge no rule won. Added for `tests/explain.rs`
+    /// (`specs/explain-v1.md` §4).
+    pub attempted_rules: Vec<String>,
+    /// Why the cascade ended where it did.
+    pub resolution_outcome: String,
 }
 
 pub async fn load_all_nodes(db: &Surreal<Any>, project_id: &str) -> Result<Vec<DbNode>> {
@@ -279,7 +309,8 @@ pub async fn load_all_edges(db: &Surreal<Any>, project_id: &str) -> Result<Vec<D
     let mut resp = db
         .query(
             "SELECT from_id, to_id, to_name, to_type, edge_type, confidence, \
-             resolved_by, candidates FROM code_edge WHERE project_id = $pid",
+             resolved_by, candidates, attempted_rules, resolution_outcome \
+             FROM code_edge WHERE project_id = $pid",
         )
         .bind(("pid", project_id.to_string()))
         .await
@@ -301,6 +332,8 @@ pub async fn load_all_edges(db: &Surreal<Any>, project_id: &str) -> Result<Vec<D
                 confidence: get_str(obj, "confidence"),
                 resolved_by: get_str(obj, "resolved_by"),
                 candidates: get_str_array(obj, "candidates"),
+                attempted_rules: get_str_array(obj, "attempted_rules"),
+                resolution_outcome: get_str(obj, "resolution_outcome"),
             })
         })
         .collect())

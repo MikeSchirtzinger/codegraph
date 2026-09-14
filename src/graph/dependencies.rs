@@ -171,11 +171,60 @@ fn index_nodes(nodes: &[ResolverNode]) -> HashMap<&str, usize> {
 /// lookup every name-anchored traversal groups its results by, rather than
 /// picking one match and blending or silently dropping the rest.
 fn matching_roots(nodes: &[ResolverNode], name: &str) -> Vec<usize> {
-    nodes
+    let mut roots: Vec<usize> = nodes
         .iter()
         .enumerate()
         .filter_map(|(i, n)| (n.name == name && n.node_type != "import").then_some(i))
-        .collect()
+        .collect();
+    // `nodes` arrives in storage order, which is NOT stable across two
+    // indexes of the same tree (measured: four fresh indexes of the polyglot
+    // fixture produced two different orderings, while six queries against one
+    // store produced one). A collided bare name emits one group per root, so
+    // unsorted roots leak that instability straight into query output and
+    // make two runs of the same audit diff against each other for no reason.
+    // Sort on identity, which is a deterministic function of the source.
+    roots.sort_by(|&a, &b| {
+        (&nodes[a].file_path, &nodes[a].qualified_name, &nodes[a].id)
+            .cmp(&(&nodes[b].file_path, &nodes[b].qualified_name, &nodes[b].id))
+    });
+    roots
+}
+
+/// Total orders for the per-group collections. Depth alone (the previous
+/// `sort_by_key`) ties constantly, and every tie was resolved by traversal
+/// order, which inherits storage order.
+fn sort_items(items: &mut [DependencyNode]) {
+    items.sort_by(|a, b| {
+        a.depth
+            .cmp(&b.depth)
+            .then_with(|| a.file_path.cmp(&b.file_path))
+            .then_with(|| a.qualified_name.cmp(&b.qualified_name))
+            .then_with(|| a.node_id.cmp(&b.node_id))
+    });
+}
+
+fn sort_unresolved(refs: &mut [UnresolvedRef]) {
+    refs.sort_by(|a, b| {
+        (&a.from_file, &a.from_name, &a.to_name, &a.to_type, a.depth).cmp(&(
+            &b.from_file,
+            &b.from_name,
+            &b.to_name,
+            &b.to_type,
+            b.depth,
+        ))
+    });
+}
+
+fn sort_ambiguous(refs: &mut [AmbiguousRef]) {
+    refs.sort_by(|a, b| {
+        (&a.from_file, &a.from_name, &a.to_name, &a.to_type, a.depth).cmp(&(
+            &b.from_file,
+            &b.from_name,
+            &b.to_name,
+            &b.to_type,
+            b.depth,
+        ))
+    });
 }
 
 /// Pure BFS core for [`get_dependencies`] — no DB access, unit-testable.
@@ -278,7 +327,9 @@ fn compute_dependencies(
             }
         }
 
-        items.sort_by_key(|d| d.depth);
+        sort_items(&mut items);
+        sort_unresolved(&mut unresolved);
+        sort_ambiguous(&mut ambiguous);
         groups.push(DependencyGroup {
             root_node_id: root.id.clone(),
             root_qualified_name: root.qualified_name.clone(),
@@ -382,7 +433,8 @@ fn compute_reverse_dependencies(
             }
         }
 
-        items.sort_by_key(|d| d.depth);
+        sort_items(&mut items);
+        sort_ambiguous(&mut ambiguous);
         groups.push(DependencyGroup {
             root_node_id: root.id.clone(),
             root_qualified_name: root.qualified_name.clone(),
@@ -402,6 +454,104 @@ fn compute_reverse_dependencies(
         stale_references,
         live_definitions,
     }
+}
+
+/// One reverse-dependent, plus the exact edge path the BFS reached it by.
+///
+/// [`compute_reverse_dependencies`] reports *that* a dependent was reached
+/// and at what depth, which is all a blast-radius list needs. An evidence
+/// chain needs the route: chain shape D (`specs/explain-v1.md` §3) names
+/// every hop and the cascade rule that bound it, so a reader can re-walk
+/// the path edge by edge instead of taking the depth number on trust.
+#[derive(Debug, Clone)]
+pub struct ReversePath {
+    pub root_node_id: String,
+    pub dependent_node_id: String,
+    /// Indices into the `edges` slice passed to
+    /// [`reverse_dependency_paths`], ordered from the root outward. Each
+    /// hop is traversed *backwards* (the edge's `to_id` is the node nearer
+    /// the root, its `from_id` the node one step further out), because this
+    /// is a reverse-dependency walk.
+    pub hops: Vec<usize>,
+}
+
+/// Reverse-dependency BFS that keeps each dependent's path, not just its
+/// depth. Deliberately mirrors [`compute_reverse_dependencies`]'s policy
+/// exactly — RESOLVED edges only, same `matching_roots` seeding, same
+/// `depth >= max_depth` cutoff, same first-visit-wins `visited` rule (so
+/// the recorded path is the BFS shortest one) — and lives beside it so the
+/// two can be diffed in review rather than drifting apart unnoticed.
+///
+/// AMBIGUOUS edges are not walked here for the same reason they are not
+/// walked there: R6 refused to pick a target, so there is no single hop to
+/// record. An ambiguous edge is reported by chain shape A instead.
+pub fn reverse_dependency_paths(
+    nodes: &[ResolverNode],
+    edges: &[QueryEdge],
+    target_name: &str,
+    max_depth: usize,
+) -> Vec<ReversePath> {
+    let by_id = index_nodes(nodes);
+
+    let mut in_resolved: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, e) in edges.iter().enumerate() {
+        if e.confidence == "RESOLVED" && !e.to_id.is_empty() {
+            in_resolved.entry(e.to_id.as_str()).or_default().push(i);
+        }
+    }
+
+    let mut out = Vec::new();
+    for root_idx in matching_roots(nodes, target_name) {
+        // node index -> (edge index that reached it, node index it came from)
+        let mut came_from: HashMap<usize, (usize, usize)> = HashMap::new();
+        let mut visited: HashSet<usize> = HashSet::new();
+        visited.insert(root_idx);
+        let mut frontier: VecDeque<(usize, usize)> = VecDeque::new();
+        frontier.push_back((root_idx, 0));
+
+        while let Some((idx, depth)) = frontier.pop_front() {
+            if depth >= max_depth {
+                continue;
+            }
+            let id = nodes[idx].id.as_str();
+            for &ei in in_resolved.get(id).map(Vec::as_slice).unwrap_or(&[]) {
+                let Some(&si) = by_id.get(edges[ei].from_id.as_str()) else {
+                    continue;
+                };
+                if !visited.insert(si) {
+                    continue;
+                }
+                came_from.insert(si, (ei, idx));
+                frontier.push_back((si, depth + 1));
+            }
+        }
+
+        for (&dep_idx, _) in came_from.iter() {
+            let mut hops = Vec::new();
+            let mut cursor = dep_idx;
+            while let Some(&(ei, prev)) = came_from.get(&cursor) {
+                hops.push(ei);
+                cursor = prev;
+            }
+            // Walked dependent -> root; the chain reads root -> dependent.
+            hops.reverse();
+            out.push(ReversePath {
+                root_node_id: nodes[root_idx].id.clone(),
+                dependent_node_id: nodes[dep_idx].id.clone(),
+                hops,
+            });
+        }
+    }
+
+    // `came_from` is a HashMap, so its iteration order is not stable across
+    // runs. Chains are a client-facing artifact and a diffable one; sort so
+    // two runs over the same index emit the same chains in the same order.
+    out.sort_by(|a, b| {
+        a.root_node_id
+            .cmp(&b.root_node_id)
+            .then_with(|| a.dependent_node_id.cmp(&b.dependent_node_id))
+    });
+    out
 }
 
 fn candidate_qualified_names(
@@ -445,7 +595,7 @@ fn find_stale_references(
         .filter(|n| n.name == queried_bare && n.node_type != "import")
         .collect();
 
-    let stale = edges
+    let mut stale: Vec<UnresolvedRef> = edges
         .iter()
         .filter(|e| e.confidence == "UNRESOLVED")
         .filter_map(|e| {
@@ -463,6 +613,9 @@ fn find_stale_references(
             })
         })
         .collect();
+    // A project-wide scan over `edges` in storage order. These are findings a
+    // client reads and re-runs, so they get a total order too.
+    sort_unresolved(&mut stale);
     (stale, live.len())
 }
 
@@ -512,6 +665,21 @@ fn find_stale_references(
 /// captures — what an incomplete rename inside one crate actually produces,
 /// and what every deletion-tracking test asserts — are unaffected either
 /// way.
+/// [`is_stale_candidate`], exposed so `graph::explain` can enumerate the
+/// exact same stale set the query layer reports rather than re-deriving the
+/// rule and risking a second, subtly different one. A chain that explained a
+/// finding the query never made, or missed one it did, would be worse than
+/// no chain at all.
+pub fn is_stale_candidate_for_explain(
+    raw_to_name: &str,
+    to_type: &str,
+    from_language: &str,
+    queried_bare: &str,
+    live: &[&ResolverNode],
+) -> bool {
+    is_stale_candidate(raw_to_name, to_type, from_language, queried_bare, live)
+}
+
 fn is_stale_candidate(
     raw_to_name: &str,
     to_type: &str,

@@ -108,11 +108,18 @@ fn compute_call_chains(
         }
     }
 
-    let roots: Vec<usize> = nodes
+    let mut roots: Vec<usize> = nodes
         .iter()
         .enumerate()
         .filter_map(|(i, n)| (n.name == function_name && n.node_type == "function").then_some(i))
         .collect();
+    // `nodes` arrives in storage order, which is not stable across two
+    // indexes of the same tree, and a collided function name emits one group
+    // per root. Same fix as `dependencies::matching_roots`.
+    roots.sort_by(|&a, &b| {
+        (&nodes[a].file_path, &nodes[a].qualified_name, &nodes[a].id)
+            .cmp(&(&nodes[b].file_path, &nodes[b].qualified_name, &nodes[b].id))
+    });
 
     let mut groups = Vec::with_capacity(roots.len());
     for root_idx in &roots {
@@ -165,7 +172,17 @@ fn compute_call_chains(
             }
         }
 
-        entries.sort_by_key(|e| e.depth);
+        // Depth alone ties constantly and left every tie to traversal
+        // order, which inherits storage order. Same defect class as
+        // `hub_nodes` and `coupling`; see those.
+        entries.sort_by(|a, b| {
+            a.depth
+                .cmp(&b.depth)
+                .then_with(|| a.caller_file.cmp(&b.caller_file))
+                .then_with(|| a.caller_name.cmp(&b.caller_name))
+                .then_with(|| a.callee_file.cmp(&b.callee_file))
+                .then_with(|| a.callee_name.cmp(&b.callee_name))
+        });
         groups.push(CallChainGroup {
             root_qualified_name: root.qualified_name.clone(),
             root_file: root.file_path.clone(),

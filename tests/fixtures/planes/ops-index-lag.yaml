@@ -1,0 +1,32 @@
+# What a file touch binds to, and what it refuses to bind to.
+#
+# Three paths, one index, three different answers. Only the last one is a
+# stale plan, and only the last one reaches `plan stale`:
+#
+#   src/late_arrival.rs   written after the index ran, so it is on disk and
+#                         not in the graph -> RESOLVED, indexed false
+#   Cargo.toml            on disk, no grammar for it, so it will never be
+#                         in the graph     -> RESOLVED, indexed false
+#   src/gone.rs           on neither disk nor index
+#                                           -> UNRESOLVED, no_such_file
+#
+# Re-indexing flips the first from indexed false to indexed true without
+# changing its confidence, which is the point: the plan was right all along
+# and the report never called it stale.
+version: 1
+project: plan-lag
+planes:
+  - id: lag
+    title: Index lag
+    status: active
+    horizon: now
+    items:
+      - id: LAG-1
+        title: Three paths, one index, three answers
+        kind: fix
+        status: active
+        touches:
+          - file: src/late_arrival.rs
+          - file: src/gone.rs
+          - file: Cargo.toml
+          - glob: "*.toml"

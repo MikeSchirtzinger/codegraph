@@ -23,6 +23,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use surrealdb::engine::any::Any;
 use surrealdb::Surreal;
 use surrealdb_types::SurrealValue;
@@ -66,6 +67,162 @@ pub struct Binding {
     /// determinism — matches the spec's data-model note verbatim
     /// ("candidates: [node_id] (AMBIGUOUS only)").
     pub candidates: Option<Vec<String>>,
+}
+
+/// What one cascade rule did with its candidate pool. Recorded in the
+/// order the cascade tried each rule, and only up to the rule that bound
+/// the edge (the cascade stops there, so recording past it would describe
+/// work that never happened).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptOutcome {
+    /// Exactly one survivor: this rule bound the edge and the cascade stopped.
+    Bound,
+    /// The rule ran; its filter admitted more than one node.
+    NotUnique,
+    /// The rule ran; its filter admitted nothing.
+    NoMatch,
+    /// The rule's precondition did not hold, so its filter never ran at
+    /// all: R2m outside Rust or on a name carrying no module prefix, R4 on
+    /// a file with no import facts. Distinct from `NoMatch` on purpose —
+    /// "the discriminator was absent" and "the discriminator was present
+    /// and admitted nothing" are different facts about the same edge, and
+    /// chain shape A (`graph::explain`) reports which one applies.
+    Skipped,
+}
+
+impl AttemptOutcome {
+    pub fn as_tag(self) -> &'static str {
+        match self {
+            AttemptOutcome::Bound => "bound",
+            AttemptOutcome::NotUnique => "not_unique",
+            AttemptOutcome::NoMatch => "no_match",
+            AttemptOutcome::Skipped => "skipped",
+        }
+    }
+}
+
+/// One rule's attempt, in cascade order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleAttempt {
+    /// `r1`, `r2`, `r2m`, `r3`, `r4`, `r5` or `r6`.
+    pub rule: &'static str,
+    /// Indices into the `nodes` slice this trace was computed against —
+    /// deliberately not node ids, so recording an attempt costs no string
+    /// allocation. Callers that need ids map them themselves.
+    pub hits: Vec<usize>,
+    pub outcome: AttemptOutcome,
+}
+
+/// Why the cascade ended where it did. Every variant is a statement about
+/// the candidate pool and the rule hit sets, so every one is re-derivable
+/// from the node set alone — which is what lets `graph::explain`'s verifier
+/// re-check it rather than trust it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolutionOutcome {
+    /// A rule narrowed to exactly one node.
+    Bound,
+    /// The edge's source node id names no node — an orphaned edge. No pool
+    /// was ever computed, so no rule ran.
+    OrphanSource,
+    /// The `(bare name, to_type, language family)` pool was empty: nothing
+    /// in this project answers to that name at all. For a stale reference
+    /// this is the renamed-away/deleted regime.
+    NoCandidates,
+    /// The pool was non-empty but the terminal rule's hit set was empty:
+    /// something is named this, and no rule admitted it. This is the
+    /// qualified-never-degrades-to-bare-tail case (`std::env::args`,
+    /// `cursor::node`) — the pool exists, R1/R2 simply do not match it.
+    NoRuleMatched,
+    /// The terminal rule's hit set held more than one node, and the cascade
+    /// refused to guess between them.
+    Ambiguous,
+}
+
+impl ResolutionOutcome {
+    pub fn as_tag(self) -> &'static str {
+        match self {
+            ResolutionOutcome::Bound => "bound",
+            ResolutionOutcome::OrphanSource => "orphan_source",
+            ResolutionOutcome::NoCandidates => "no_candidates",
+            ResolutionOutcome::NoRuleMatched => "no_rule_matched",
+            ResolutionOutcome::Ambiguous => "ambiguous",
+        }
+    }
+}
+
+/// The cascade's work, not just its verdict: which rules ran, what each
+/// admitted, and why the last one produced what it did.
+///
+/// This is the derivation `specs/explain-v1.md` §4 calls the one real
+/// prerequisite for chain shapes S, A and D. The *binding* half of that
+/// prerequisite (`resolved_by`) has been persisted since the resolver
+/// landed; what was missing is everything a rule that did NOT bind did,
+/// which is precisely what an UNRESOLVED or AMBIGUOUS finding has to show
+/// to be checkable rather than asserted.
+///
+/// `pool_size` is the count only. Pool *membership* is recomputed at
+/// explain time via [`candidate_pool`] (deterministic given the node set —
+/// the spec's own rule that pools are recomputed, never persisted), which
+/// keeps tracing free of per-edge pool clones.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolutionTrace {
+    /// `to_name` with separators normalized to `::` (the matching form;
+    /// the edge's stored `to_name` stays verbatim).
+    pub normalized: String,
+    /// The last `::`-segment of `normalized` — the candidate-pool key's
+    /// name component.
+    pub bare: String,
+    /// Whether the capture was qualified (R1/R2/R2m territory) or bare
+    /// (R3/R4/R5 territory).
+    pub qualified: bool,
+    /// The language family the pool was scoped to (`language_family` of the
+    /// *calling* edge's source node).
+    pub language_family: String,
+    /// Size of the `(bare, to_type, language_family)` candidate pool.
+    pub pool_size: usize,
+    /// Every rule the cascade actually reached, in order.
+    pub attempts: Vec<RuleAttempt>,
+    pub outcome: ResolutionOutcome,
+}
+
+impl ResolutionTrace {
+    /// The rule tags, in cascade order — the `attempted_rules` column.
+    pub fn attempted_rules(&self) -> Vec<String> {
+        self.attempts.iter().map(|a| a.rule.to_string()).collect()
+    }
+}
+
+/// Records what each rule did. Two implementations: a zero-sized no-op for
+/// [`resolve_one`] (monomorphized away entirely, so the untraced cascade
+/// keeps its exact previous allocation profile) and a collecting one for
+/// [`resolve_one_traced`]. One cascade body serves both, so the trace can
+/// never describe a cascade different from the one that ran.
+trait Recorder {
+    fn attempt(&mut self, rule: &'static str, hits: &[usize], outcome: AttemptOutcome);
+}
+
+struct NoTrace;
+
+impl Recorder for NoTrace {
+    #[inline(always)]
+    fn attempt(&mut self, _rule: &'static str, _hits: &[usize], _outcome: AttemptOutcome) {}
+}
+
+#[derive(Default)]
+struct CollectTrace {
+    attempts: Vec<RuleAttempt>,
+}
+
+impl Recorder for CollectTrace {
+    fn attempt(&mut self, rule: &'static str, hits: &[usize], outcome: AttemptOutcome) {
+        self.attempts.push(RuleAttempt {
+            rule,
+            hits: hits.to_vec(),
+            outcome,
+        });
+    }
 }
 
 /// One fact extracted from a Rust `use` declaration — R4's only feed in v1
@@ -266,15 +423,90 @@ pub fn build_indices(nodes: &[ResolverNode]) -> Indices {
 /// prefix is real information ("HashMap::" is *not* "CodegraphServer::"
 /// with the module elided) that bare-tail fallback silently discards.
 pub fn resolve_one(edge: &UnresolvedEdge, nodes: &[ResolverNode], indices: &Indices) -> Binding {
+    cascade(edge, nodes, indices, &mut NoTrace).0
+}
+
+/// [`resolve_one`], plus the derivation: which rules ran, what each one's
+/// filter admitted, and why the cascade ended where it did. Same cascade
+/// body, same verdict, by construction — the only difference is that the
+/// recorder collects instead of discarding (see [`Recorder`]).
+///
+/// This is what `graph::explain` builds chain links out of, and what its
+/// verifier re-runs to check a chain rather than trust it.
+pub fn resolve_one_traced(
+    edge: &UnresolvedEdge,
+    nodes: &[ResolverNode],
+    indices: &Indices,
+) -> (Binding, ResolutionTrace) {
+    let mut rec = CollectTrace::default();
+    let (binding, mut trace) = cascade(edge, nodes, indices, &mut rec);
+    trace.attempts = rec.attempts;
+    (binding, trace)
+}
+
+/// The `(bare name, to_type, language family)` candidate pool the cascade
+/// scopes every rule to, as indices into `nodes`. Recomputed at explain
+/// time rather than persisted (`specs/explain-v1.md` §4) — it is a pure
+/// function of the node set, so recomputing it is the check.
+///
+/// `bare` must already be normalized (`bare_name(&normalize_separators(..))`)
+/// and `family` must already be mapped through [`language_family`], exactly
+/// as the cascade does it — passing a raw language tag here would scope a
+/// pool the cascade never used.
+pub fn candidate_pool<'a>(
+    indices: &'a Indices,
+    bare: &str,
+    to_type: &str,
+    family: &str,
+) -> &'a [usize] {
+    indices
+        .by_bare_key
+        .get(&(bare.to_string(), to_type.to_string(), family.to_string()))
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+/// Whether R4 has anything to work with for `file_path`: true iff that file
+/// contributed at least one import fact. The "discriminator that was
+/// absent" in chain shape A (`specs/explain-v1.md` §3) is exactly this
+/// returning false.
+pub fn has_import_facts(indices: &Indices, file_path: &str) -> bool {
+    indices
+        .import_facts
+        .get(file_path)
+        .is_some_and(|f| !f.is_empty())
+}
+
+/// The one cascade body, generic over its recorder so the traced and
+/// untraced entry points can never diverge. `NoTrace` monomorphizes to
+/// nothing, so [`resolve_one`] keeps the allocation profile it had before
+/// tracing existed.
+fn cascade<R: Recorder>(
+    edge: &UnresolvedEdge,
+    nodes: &[ResolverNode],
+    indices: &Indices,
+    rec: &mut R,
+) -> (Binding, ResolutionTrace) {
     let Some(&src_idx) = indices.by_id.get(edge.from_id.as_str()) else {
         // Orphaned edge (source node missing) — shouldn't happen from a
         // real extractor pass, but fails safe rather than panicking.
-        return Binding {
-            to_id: None,
-            confidence: "UNRESOLVED",
-            resolved_by: "r6",
-            candidates: None,
-        };
+        return (
+            Binding {
+                to_id: None,
+                confidence: "UNRESOLVED",
+                resolved_by: "r6",
+                candidates: None,
+            },
+            ResolutionTrace {
+                normalized: normalize_separators(&edge.to_name),
+                bare: String::new(),
+                qualified: false,
+                language_family: String::new(),
+                pool_size: 0,
+                attempts: Vec::new(),
+                outcome: ResolutionOutcome::OrphanSource,
+            },
+        );
     };
     let source = &nodes[src_idx];
 
@@ -293,6 +525,36 @@ pub fn resolve_one(edge: &UnresolvedEdge, nodes: &[ResolverNode], indices: &Indi
         .map(Vec::as_slice)
         .unwrap_or(&[]);
 
+    let (binding, outcome) =
+        cascade_rules(nodes, indices, source, &normalized, is_qualified, pool, rec);
+
+    let trace = ResolutionTrace {
+        pool_size: pool.len(),
+        normalized,
+        bare: key.0,
+        qualified: is_qualified,
+        language_family: key.2,
+        // Filled in by `resolve_one_traced` from the recorder; `resolve_one`
+        // discards the trace wholesale, so leaving this empty here is what
+        // keeps the untraced path free of the collection entirely.
+        attempts: Vec::new(),
+        outcome,
+    };
+    (binding, trace)
+}
+
+/// The R1-R6 rule sequence itself. Every `return` is a rule that narrowed
+/// to exactly one node; falling through to a `terminal` call is R5/R6.
+#[allow(clippy::too_many_arguments)]
+fn cascade_rules<R: Recorder>(
+    nodes: &[ResolverNode],
+    indices: &Indices,
+    source: &ResolverNode,
+    normalized: &str,
+    is_qualified: bool,
+    pool: &[usize],
+    rec: &mut R,
+) -> (Binding, ResolutionOutcome) {
     if is_qualified {
         // R1: exact qualified_name match.
         let r1_hits: Vec<usize> = pool
@@ -301,8 +563,10 @@ pub fn resolve_one(edge: &UnresolvedEdge, nodes: &[ResolverNode], indices: &Indi
             .filter(|&i| nodes[i].qualified_name == normalized)
             .collect();
         if r1_hits.len() == 1 {
-            return bind(&nodes[r1_hits[0]], "r1");
+            rec.attempt("r1", &r1_hits, AttemptOutcome::Bound);
+            return (bind(&nodes[r1_hits[0]], "r1"), ResolutionOutcome::Bound);
         }
+        rec.attempt("r1", &r1_hits, non_binding_outcome(&r1_hits));
 
         // R2: qualified-suffix match (`db::connect` binds `myapp::db::connect`).
         let suffix = format!("::{normalized}");
@@ -312,8 +576,10 @@ pub fn resolve_one(edge: &UnresolvedEdge, nodes: &[ResolverNode], indices: &Indi
             .filter(|&i| nodes[i].qualified_name.ends_with(&suffix))
             .collect();
         if r2_hits.len() == 1 {
-            return bind(&nodes[r2_hits[0]], "r2");
+            rec.attempt("r2", &r2_hits, AttemptOutcome::Bound);
+            return (bind(&nodes[r2_hits[0]], "r2"), ResolutionOutcome::Bound);
         }
+        rec.attempt("r2", &r2_hits, non_binding_outcome(&r2_hits));
 
         // R2m — Rust module-relative retry (a second empirical correction, in
         // the same spirit as the qualified-never-degrades-to-bare-tail rule
@@ -330,7 +596,7 @@ pub fn resolve_one(edge: &UnresolvedEdge, nodes: &[ResolverNode], indices: &Indi
         // 2026-07-11 (`examples/resolver_ceiling.rs`): 25 self-index edges,
         // every one unique — e.g. `crate::db::connect`, `super::load_project_edges`.
         if source.language == "rust" {
-            let rel = strip_rust_module_prefix(&normalized);
+            let rel = strip_rust_module_prefix(normalized);
             if rel != normalized {
                 let rel_suffix = format!("::{rel}");
                 let rm_hits: Vec<usize> = pool
@@ -342,9 +608,18 @@ pub fn resolve_one(edge: &UnresolvedEdge, nodes: &[ResolverNode], indices: &Indi
                     })
                     .collect();
                 if rm_hits.len() == 1 {
-                    return bind(&nodes[rm_hits[0]], "r2m");
+                    rec.attempt("r2m", &rm_hits, AttemptOutcome::Bound);
+                    return (bind(&nodes[rm_hits[0]], "r2m"), ResolutionOutcome::Bound);
                 }
+                rec.attempt("r2m", &rm_hits, non_binding_outcome(&rm_hits));
+            } else {
+                // Rust, but the capture carries no `crate::`/`self::`/
+                // `super::` prefix to strip — R2m's precondition fails.
+                rec.attempt("r2m", &[], AttemptOutcome::Skipped);
             }
+        } else {
+            // R2m is Rust-only (its tokens are Rust keywords).
+            rec.attempt("r2m", &[], AttemptOutcome::Skipped);
         }
 
         // Terminal: R1 and R2's conditions are mutually exclusive (exact
@@ -352,7 +627,7 @@ pub fn resolve_one(edge: &UnresolvedEdge, nodes: &[ResolverNode], indices: &Indi
         // their hits never overlap — no dedup needed beyond concatenation.
         let mut combined = r1_hits;
         combined.extend(r2_hits);
-        return terminal(nodes, &combined);
+        return terminal(nodes, &combined, pool.is_empty(), rec);
     }
 
     // R3: same-file bare-name match.
@@ -362,8 +637,10 @@ pub fn resolve_one(edge: &UnresolvedEdge, nodes: &[ResolverNode], indices: &Indi
         .filter(|&i| nodes[i].file_path == source.file_path)
         .collect();
     if hits.len() == 1 {
-        return bind(&nodes[hits[0]], "r3");
+        rec.attempt("r3", &hits, AttemptOutcome::Bound);
+        return (bind(&nodes[hits[0]], "r3"), ResolutionOutcome::Bound);
     }
+    rec.attempt("r3", &hits, non_binding_outcome(&hits));
 
     // R4: import-informed. Only Rust files carry any `import_facts` entry
     // today — every other language's files have none, so this naturally
@@ -375,13 +652,30 @@ pub fn resolve_one(edge: &UnresolvedEdge, nodes: &[ResolverNode], indices: &Indi
             .filter(|&i| facts.iter().any(|f| f.matches(&nodes[i].qualified_name)))
             .collect();
         if hits.len() == 1 {
-            return bind(&nodes[hits[0]], "r4");
+            rec.attempt("r4", &hits, AttemptOutcome::Bound);
+            return (bind(&nodes[hits[0]], "r4"), ResolutionOutcome::Bound);
         }
+        rec.attempt("r4", &hits, non_binding_outcome(&hits));
+    } else {
+        // The source file contributed no import facts at all — R4 had no
+        // discriminator to apply. Chain shape A reports this verbatim.
+        rec.attempt("r4", &[], AttemptOutcome::Skipped);
     }
 
     // R5 + R6 terminal: project-unique bare name (within this edge's
     // language family), else AMBIGUOUS/UNRESOLVED over the full pool.
-    terminal(nodes, pool)
+    terminal(nodes, pool, pool.is_empty(), rec)
+}
+
+/// A rule that ran but did not bind: its hit set was either empty or
+/// larger than one (length exactly one is handled by the caller's
+/// early return, which is the binding case).
+fn non_binding_outcome(hits: &[usize]) -> AttemptOutcome {
+    if hits.is_empty() {
+        AttemptOutcome::NoMatch
+    } else {
+        AttemptOutcome::NotUnique
+    }
 }
 
 /// R6, shared by both branches above: exactly one survivor resolves (only
@@ -389,26 +683,50 @@ pub fn resolve_one(edge: &UnresolvedEdge, nodes: &[ResolverNode], indices: &Indi
 /// branch's R1/R2 already returned early on their own exactly-one case, so
 /// its `hits` here is never length 1); more than one is AMBIGUOUS with
 /// every survivor as a candidate; none is UNRESOLVED.
-fn terminal(nodes: &[ResolverNode], hits: &[usize]) -> Binding {
+///
+/// `pool_empty` distinguishes the two ways an empty hit set arises, which
+/// is the distinction a stale-reference finding turns on: nothing in the
+/// project answers to the name at all (`NoCandidates` — the renamed-away
+/// regime), versus something does but no rule admitted it (`NoRuleMatched`
+/// — the qualified-capture regime, e.g. `std::env::args`).
+fn terminal<R: Recorder>(
+    nodes: &[ResolverNode],
+    hits: &[usize],
+    pool_empty: bool,
+    rec: &mut R,
+) -> (Binding, ResolutionOutcome) {
     if hits.len() == 1 {
-        return bind(&nodes[hits[0]], "r5");
+        rec.attempt("r5", hits, AttemptOutcome::Bound);
+        return (bind(&nodes[hits[0]], "r5"), ResolutionOutcome::Bound);
     }
     if hits.is_empty() {
-        return Binding {
-            to_id: None,
-            confidence: "UNRESOLVED",
-            resolved_by: "r6",
-            candidates: None,
-        };
+        rec.attempt("r6", hits, AttemptOutcome::NoMatch);
+        return (
+            Binding {
+                to_id: None,
+                confidence: "UNRESOLVED",
+                resolved_by: "r6",
+                candidates: None,
+            },
+            if pool_empty {
+                ResolutionOutcome::NoCandidates
+            } else {
+                ResolutionOutcome::NoRuleMatched
+            },
+        );
     }
+    rec.attempt("r6", hits, AttemptOutcome::NotUnique);
     let mut ids: Vec<String> = hits.iter().map(|&i| nodes[i].id.clone()).collect();
     ids.sort();
-    Binding {
-        to_id: None,
-        confidence: "AMBIGUOUS",
-        resolved_by: "r6",
-        candidates: Some(ids),
-    }
+    (
+        Binding {
+            to_id: None,
+            confidence: "AMBIGUOUS",
+            resolved_by: "r6",
+            candidates: Some(ids),
+        },
+        ResolutionOutcome::Ambiguous,
+    )
 }
 
 fn bind(node: &ResolverNode, rule: &'static str) -> Binding {
@@ -428,6 +746,19 @@ fn bind(node: &ResolverNode, rule: &'static str) -> Binding {
 pub fn resolve_all(nodes: &[ResolverNode], edges: &[UnresolvedEdge]) -> Vec<Binding> {
     let indices = build_indices(nodes);
     edges.iter().map(|e| resolve_one(e, nodes, &indices)).collect()
+}
+
+/// [`resolve_all`], keeping each edge's derivation alongside its binding —
+/// what the full pass writes `attempted_rules`/`resolution_outcome` from.
+pub fn resolve_all_traced(
+    nodes: &[ResolverNode],
+    edges: &[UnresolvedEdge],
+) -> Vec<(Binding, ResolutionTrace)> {
+    let indices = build_indices(nodes);
+    edges
+        .iter()
+        .map(|e| resolve_one_traced(e, nodes, &indices))
+        .collect()
 }
 
 // ============================================================================
@@ -549,19 +880,6 @@ pub struct ResolveStats {
     pub file_refs: usize,
 }
 
-/// One row's worth of resolver output, ready to write back — carries the
-/// original (verbatim) identifying fields alongside the computed `Binding`
-/// so the write-back can re-find the exact row(s) it came from. Used by the
-/// incremental pass (`resolve_incremental`), whose small, targeted
-/// affected-set is written with `write_updates`'s per-edge UPDATE-by-WHERE.
-struct EdgeUpdate {
-    from_id: String,
-    to_name: String,
-    to_type: String,
-    edge_type: String,
-    binding: Binding,
-}
-
 /// A fully-materialized `code_edge` name-edge row, ready for a bulk `INSERT`.
 /// The full pass (`resolve_project`) rewrites its whole unresolved set by
 /// delete-and-reinsert of these rather than 4k+ per-edge UPDATEs — an INSERT
@@ -583,9 +901,53 @@ struct ResolvedEdgeRow {
     resolved_by: String,
     resolution_gen: i64,
     candidates: Option<Vec<String>>,
+    /// Every cascade rule that actually ran for this edge, in order —
+    /// `["r1","r2","r2m","r6"]` for a qualified capture nothing matched.
+    /// `resolved_by` names only the rule that *won*; on an UNRESOLVED or
+    /// AMBIGUOUS edge no rule won, so without this the row records that
+    /// resolution failed but nothing about what was tried.
+    /// (`specs/explain-v1.md` §4.)
+    attempted_rules: Option<Vec<String>>,
+    /// Why the cascade ended where it did — [`ResolutionOutcome::as_tag`].
+    /// Distinguishes "nothing in the project is named this" from "something
+    /// is, and no rule admitted it", which is the distinction a
+    /// stale-reference finding rests on.
+    resolution_outcome: String,
 }
 
 const WRITE_CHUNK_SIZE: usize = 250;
+
+/// A `code_edge` name-edge row as currently stored, with its whole binding.
+///
+/// The incremental pass needs more than the lookup key. Its write-back
+/// deletes by `from_id` and reinserts, which sweeps up edges that share a
+/// source node but were not themselves re-resolved; those siblings are
+/// rewritten from these stored values verbatim, `resolution_gen` included,
+/// so selectivity still means what it says (an edge nothing touched keeps
+/// its old generation, which is what proves it was never re-examined).
+#[derive(Clone)]
+struct StoredEdge {
+    edge: UnresolvedEdge,
+    to_id: String,
+    confidence: String,
+    resolved_by: String,
+    resolution_gen: i64,
+    candidates: Vec<String>,
+    attempted_rules: Vec<String>,
+    resolution_outcome: String,
+    weight: f64,
+}
+
+/// A derived file-level edge, ready for a bulk `INSERT` (see
+/// [`write_file_refs`], which used to issue one `CREATE` per pair).
+#[derive(Clone, SurrealValue)]
+struct FileRefRow {
+    from_file: String,
+    to_file: String,
+    edge_type: String,
+    project_id: String,
+    confidence: String,
+}
 
 /// Run the full resolver pass for one project: load its nodes and every
 /// currently-unresolved (`to_id = ""`) edge, apply the cascade, write
@@ -617,8 +979,8 @@ pub async fn resolve_project(db: &Surreal<Any>, project_id: &str) -> Result<Reso
     // order, though order has no functional effect here.
     let mut file_pairs: BTreeSet<(String, String)> = BTreeSet::new();
 
-    let bindings = resolve_all(&nodes, &edges);
-    for (edge, binding) in edges.into_iter().zip(bindings) {
+    let bindings = resolve_all_traced(&nodes, &edges);
+    for (edge, (binding, trace)) in edges.into_iter().zip(bindings) {
         match binding.confidence {
             "RESOLVED" => {
                 stats.resolved += 1;
@@ -647,6 +1009,8 @@ pub async fn resolve_project(db: &Surreal<Any>, project_id: &str) -> Result<Reso
             resolved_by: binding.resolved_by.to_string(),
             resolution_gen: gen,
             candidates: binding.candidates,
+            attempted_rules: Some(trace.attempted_rules()),
+            resolution_outcome: trace.outcome.as_tag().to_string(),
         });
     }
 
@@ -736,44 +1100,110 @@ pub async fn resolve_incremental(
         .map(|n| n.id.as_str())
         .collect();
 
-    let affected: Vec<UnresolvedEdge> = all_edges
-        .into_iter()
-        .filter(|e| {
-            if changed_ids.contains(e.from_id.as_str()) {
-                return true;
-            }
-            let normalized = normalize_separators(&e.to_name);
-            delta_names.contains(bare_name(&normalized))
-        })
-        .collect();
+    let is_affected = |e: &UnresolvedEdge| -> bool {
+        if changed_ids.contains(e.from_id.as_str()) {
+            return true;
+        }
+        let normalized = normalize_separators(&e.to_name);
+        delta_names.contains(bare_name(&normalized))
+    };
 
     let mut stats = ResolveStats {
-        edges_considered: affected.len(),
+        edges_considered: all_edges.iter().filter(|s| is_affected(&s.edge)).count(),
         ..Default::default()
     };
 
+    // Write-back is delete-and-reinsert keyed on the SOURCE NODE, not an
+    // UPDATE per edge. The previous shape issued one
+    // `UPDATE ... WHERE project_id = .. AND from_id = .. AND to_name = ..
+    // AND to_type = .. AND edge_type = ..` per affected edge, and the cost
+    // was not the SQL text: a per-row conditional UPDATE has to find its row,
+    // so N updates over an N-edge table is quadratic work. Measured on cobra
+    // (4,458 edges) that was 195.5B instructions retired in a 40.6s resolve
+    // phase, against 17.1B and 0.9s for the `--force` path doing the same
+    // cascade with a bulk insert. Rewriting the same statements as one
+    // server-side `FOR` loop over a bound array was measured too and made it
+    // WORSE (306.2B), which is what ruled the parsing explanation out.
+    //
+    // Deleting by `from_id` sweeps up edges that share a source node but were
+    // not re-resolved this pass, so those siblings are reinserted from their
+    // stored values verbatim, `resolution_gen` included. Selectivity is
+    // therefore unchanged: an edge nothing touched still carries its old
+    // generation afterwards.
     let indices = build_indices(&nodes);
-    let mut updates = Vec::with_capacity(affected.len());
-    for edge in affected {
-        let binding = resolve_one(&edge, &nodes, &indices);
-        match binding.confidence {
-            "RESOLVED" => stats.resolved += 1,
-            "AMBIGUOUS" => stats.ambiguous += 1,
-            _ => stats.unresolved += 1,
+    let mut touched_sources: BTreeSet<String> = BTreeSet::new();
+    for stored in &all_edges {
+        if is_affected(&stored.edge) {
+            touched_sources.insert(stored.edge.from_id.clone());
         }
-        updates.push(EdgeUpdate {
-            from_id: edge.from_id,
-            to_name: edge.to_name,
-            to_type: edge.to_type,
-            edge_type: edge.edge_type,
-            binding,
-        });
     }
 
-    // Unlike `resolve_project`'s call, this must NOT require `to_id = ''` —
-    // the whole point is being able to flip an already-RESOLVED edge whose
-    // target just got renamed away.
-    write_updates(db, project_id, &updates, gen, false).await?;
+    let mut rows: Vec<ResolvedEdgeRow> = Vec::new();
+    for stored in &all_edges {
+        if !touched_sources.contains(stored.edge.from_id.as_str()) {
+            continue; // its row is never deleted, so it is never rewritten
+        }
+        let row = if is_affected(&stored.edge) {
+            let (binding, trace) = resolve_one_traced(&stored.edge, &nodes, &indices);
+            match binding.confidence {
+                "RESOLVED" => stats.resolved += 1,
+                "AMBIGUOUS" => stats.ambiguous += 1,
+                _ => stats.unresolved += 1,
+            }
+            ResolvedEdgeRow {
+                from_id: stored.edge.from_id.clone(),
+                to_id: binding.to_id.unwrap_or_default(),
+                to_name: Some(stored.edge.to_name.clone()),
+                to_type: Some(stored.edge.to_type.clone()),
+                edge_type: stored.edge.edge_type.clone(),
+                confidence: binding.confidence.to_string(),
+                weight: stored.weight,
+                project_id: project_id.to_string(),
+                resolved_by: binding.resolved_by.to_string(),
+                resolution_gen: gen,
+                candidates: binding.candidates,
+                attempted_rules: Some(trace.attempted_rules()),
+                resolution_outcome: trace.outcome.as_tag().to_string(),
+            }
+        } else {
+            ResolvedEdgeRow {
+                from_id: stored.edge.from_id.clone(),
+                to_id: stored.to_id.clone(),
+                to_name: Some(stored.edge.to_name.clone()),
+                to_type: Some(stored.edge.to_type.clone()),
+                edge_type: stored.edge.edge_type.clone(),
+                confidence: stored.confidence.clone(),
+                weight: stored.weight,
+                project_id: project_id.to_string(),
+                resolved_by: stored.resolved_by.clone(),
+                resolution_gen: stored.resolution_gen,
+                candidates: (!stored.candidates.is_empty()).then(|| stored.candidates.clone()),
+                attempted_rules: (!stored.attempted_rules.is_empty())
+                    .then(|| stored.attempted_rules.clone()),
+                resolution_outcome: stored.resolution_outcome.clone(),
+            }
+        };
+        rows.push(row);
+    }
+
+    let source_ids: Vec<String> = touched_sources.into_iter().collect();
+    if !source_ids.is_empty() {
+        // Same exclusions as `load_all_edges`, so EXTRACTED rows (`contains`,
+        // same-file macro `calls`) and derived `file_ref` rows are never
+        // swept up by this delete.
+        db.query(
+            "DELETE code_edge WHERE project_id = $pid AND from_id IN $ids \
+             AND confidence != 'EXTRACTED' AND edge_type != 'file_ref'",
+        )
+        .bind(("pid", project_id.to_string()))
+        .bind(("ids", source_ids))
+        .await
+        .context("clearing re-resolved edges before rewrite failed")?
+        .check()
+        .context("clearing re-resolved edges returned an error")?;
+        insert_resolved_edges(db, &rows).await?;
+    }
+
     stats.file_refs = recompute_file_refs(db, project_id, &nodes).await?;
 
     Ok(stats)
@@ -900,10 +1330,12 @@ async fn load_unresolved_edges(db: &Surreal<Any>, project_id: &str) -> Result<Ve
 /// `parser::ExtractionContext::add_edge`) and derived `file_ref` rows (a
 /// different row shape entirely: `from_file`/`to_file`, no
 /// `from_id`/`to_name`).
-async fn load_all_edges(db: &Surreal<Any>, project_id: &str) -> Result<Vec<UnresolvedEdge>> {
+async fn load_all_edges(db: &Surreal<Any>, project_id: &str) -> Result<Vec<StoredEdge>> {
     let mut resp = db
         .query(
-            "SELECT from_id, to_name, to_type, edge_type FROM code_edge \
+            "SELECT from_id, to_name, to_type, edge_type, to_id, confidence, resolved_by, \
+             resolution_gen, candidates, attempted_rules, resolution_outcome, weight \
+             FROM code_edge \
              WHERE project_id = $pid AND confidence != 'EXTRACTED' AND edge_type != 'file_ref'",
         )
         .bind(("pid", project_id.to_string()))
@@ -921,14 +1353,47 @@ async fn load_all_edges(db: &Surreal<Any>, project_id: &str) -> Result<Vec<Unres
             if from_id.is_empty() {
                 return None;
             }
-            Some(UnresolvedEdge {
-                from_id,
-                to_name: extract_str(obj, "to_name"),
-                to_type: extract_str(obj, "to_type"),
-                edge_type: extract_str(obj, "edge_type"),
+            Some(StoredEdge {
+                edge: UnresolvedEdge {
+                    from_id,
+                    to_name: extract_str(obj, "to_name"),
+                    to_type: extract_str(obj, "to_type"),
+                    edge_type: extract_str(obj, "edge_type"),
+                },
+                to_id: extract_str(obj, "to_id"),
+                confidence: extract_str(obj, "confidence"),
+                resolved_by: extract_str(obj, "resolved_by"),
+                resolution_gen: extract_i64(obj, "resolution_gen").unwrap_or(0),
+                candidates: extract_str_array(obj, "candidates"),
+                attempted_rules: extract_str_array(obj, "attempted_rules"),
+                resolution_outcome: extract_str(obj, "resolution_outcome"),
+                weight: extract_f64(obj, "weight").unwrap_or(1.0),
             })
         })
         .collect())
+}
+
+fn extract_str_array(obj: &surrealdb_types::Object, key: &str) -> Vec<String> {
+    obj.get(key)
+        .and_then(|v| match v {
+            surrealdb_types::Value::Array(arr) => Some(
+                arr.iter()
+                    .filter_map(|i| match i {
+                        surrealdb_types::Value::String(s) => Some(s.to_string()),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn extract_f64(obj: &surrealdb_types::Object, key: &str) -> Option<f64> {
+    match obj.get(key) {
+        Some(surrealdb_types::Value::Number(n)) => n.clone().into_float().ok(),
+        _ => None,
+    }
 }
 
 /// One symbol currently stored for a file — the "before" half of the
@@ -1025,57 +1490,6 @@ async fn next_resolution_gen(db: &Surreal<Any>, project_id: &str) -> Result<i64>
     Ok(max_gen + 1)
 }
 
-/// Write every binding back in chunks of `WRITE_CHUNK_SIZE` statements per
-/// round trip — one already-open `db` session throughout (never reopens
-/// the store), batched rather than one query per edge.
-///
-/// `require_unresolved` gates an extra `AND to_id = ''` on every UPDATE's
-/// WHERE clause. `resolve_project`'s full pass only ever loads `to_id = ''`
-/// rows to begin with (`load_unresolved_edges`), so the guard is redundant
-/// there but harmless (`true`, preserves its exact prior behavior).
-/// `resolve_incremental` must be able to flip an edge that's already
-/// RESOLVED — e.g. its target got renamed away — so it needs the guard
-/// dropped (`false`).
-async fn write_updates(
-    db: &Surreal<Any>,
-    project_id: &str,
-    updates: &[EdgeUpdate],
-    gen: i64,
-    require_unresolved: bool,
-) -> Result<()> {
-    let guard = if require_unresolved { " AND to_id = ''" } else { "" };
-    for chunk in updates.chunks(WRITE_CHUNK_SIZE) {
-        let mut sql = String::new();
-        for i in 0..chunk.len() {
-            sql.push_str(&format!(
-                "UPDATE code_edge SET to_id = $to_id{i}, confidence = $conf{i}, \
-                 resolved_by = $rb{i}, resolution_gen = $gen, candidates = $cand{i} \
-                 WHERE project_id = $pid AND from_id = $from{i} AND to_name = $tname{i} \
-                 AND to_type = $ttype{i} AND edge_type = $etype{i}{guard};\n"
-            ));
-        }
-
-        let mut q = db
-            .query(sql)
-            .bind(("pid", project_id.to_string()))
-            .bind(("gen", gen));
-        for (i, u) in chunk.iter().enumerate() {
-            q = q.bind((format!("to_id{i}"), u.binding.to_id.clone().unwrap_or_default()));
-            q = q.bind((format!("conf{i}"), u.binding.confidence.to_string()));
-            q = q.bind((format!("rb{i}"), u.binding.resolved_by.to_string()));
-            q = q.bind((format!("cand{i}"), u.binding.candidates.clone()));
-            q = q.bind((format!("from{i}"), u.from_id.clone()));
-            q = q.bind((format!("tname{i}"), u.to_name.clone()));
-            q = q.bind((format!("ttype{i}"), u.to_type.clone()));
-            q = q.bind((format!("etype{i}"), u.edge_type.clone()));
-        }
-
-        let resp = q.await.context("resolver batch update failed")?;
-        resp.check().context("resolver batch update returned an error")?;
-    }
-    Ok(())
-}
-
 /// Fully re-derive `file_ref` for this project: clear whatever a previous
 /// pass wrote, then insert the current cross-file RESOLVED pairs. Kept as
 /// ordinary rows in the same `code_edge` table (`edge_type = 'file_ref'`,
@@ -1096,16 +1510,27 @@ async fn write_file_refs(
         .await
         .context("clearing stale file_ref edges failed")?;
 
-    for (from_file, to_file) in pairs {
-        db.query(
-            "CREATE code_edge SET edge_type = 'file_ref', from_file = $ff, to_file = $tf, \
-             project_id = $pid, confidence = 'RESOLVED'",
-        )
-        .bind(("pid", project_id.to_string()))
-        .bind(("ff", from_file.clone()))
-        .bind(("tf", to_file.clone()))
-        .await
-        .context("creating file_ref edge failed")?;
+    // Bulk INSERT in chunks rather than one CREATE per pair. Same rows, same
+    // fields; cobra derives 60 of these and zstd 451, each of which was its
+    // own statement and its own round trip.
+    let rows: Vec<FileRefRow> = pairs
+        .iter()
+        .map(|(from_file, to_file)| FileRefRow {
+            from_file: from_file.clone(),
+            to_file: to_file.clone(),
+            edge_type: "file_ref".to_string(),
+            project_id: project_id.to_string(),
+            confidence: "RESOLVED".to_string(),
+        })
+        .collect();
+
+    for chunk in rows.chunks(WRITE_CHUNK_SIZE) {
+        db.query("INSERT INTO code_edge $rows")
+            .bind(("rows", chunk.to_vec()))
+            .await
+            .context("creating file_ref edges failed")?
+            .check()
+            .context("creating file_ref edges returned an error")?;
     }
 
     Ok(pairs.len())

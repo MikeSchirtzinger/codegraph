@@ -1,0 +1,43 @@
+# Whose stale touches are worth reporting.
+#
+# All three items name a symbol that does not exist in tests/fixtures/rust,
+# so all three carry an UNRESOLVED touch. Only one of them is a stale plan:
+#
+#   DONE-1   status done       already landed; the code it named has every
+#                              right to have moved on since
+#   GONE-1   status abandoned  deliberately dropped, kept so the decision
+#                              stays visible
+#   LIVE-1   status planned    still points at work someone will pick up,
+#                              and it points at nothing
+#
+# A report that lists the first two asks the reader to fix something that is
+# already settled, which is how a staleness report fills up with entries
+# nobody can close.
+version: 1
+project: plan-done
+planes:
+  - id: shipped
+    title: Work in three states
+    status: active
+    horizon: now
+    items:
+      - id: DONE-1
+        title: Landed, and the symbol it named is gone
+        kind: refactor
+        status: done
+        touches:
+          - symbol: no_such_function_anywhere
+
+      - id: GONE-1
+        title: Dropped on purpose, and its symbol went with it
+        kind: feature
+        status: abandoned
+        touches:
+          - symbol: also_not_a_real_symbol
+
+      - id: LIVE-1
+        title: Still planned, and pointing at nothing
+        kind: fix
+        status: planned
+        touches:
+          - symbol: still_missing_symbol

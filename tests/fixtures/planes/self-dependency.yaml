@@ -1,0 +1,15 @@
+version: 1
+project: fixture-project
+planes:
+  - id: only
+    title: Only
+    status: active
+    horizon: now
+    items:
+      - id: S-1
+        title: Blocks itself
+        kind: feature
+        status: planned
+        depends_on: [S-1]
+        touches:
+          - file: src/a.rs

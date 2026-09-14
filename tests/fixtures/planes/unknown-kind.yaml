@@ -1,0 +1,14 @@
+version: 1
+project: fixture-project
+planes:
+  - id: only
+    title: Only
+    status: active
+    horizon: now
+    items:
+      - id: K-1
+        title: Bad kind
+        kind: chore
+        status: planned
+        touches:
+          - file: src/a.rs

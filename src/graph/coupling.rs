@@ -68,7 +68,26 @@ pub async fn calculate_file_coupling(
             if let (Some(name), Some(ntype), Some(fp)) =
                 (get_str(obj, "name"), get_str(obj, "node_type"), fp)
             {
-                name_to_file.entry((name, ntype)).or_insert(fp);
+                // "First match wins" used to mean "whichever row storage
+                // happened to return first", and storage order is not stable
+                // across two indexes of the same tree. For a name defined in
+                // more than one file (`connect` in both `api/app.py` and
+                // `worker/main.go` in the polyglot fixture) that flipped which
+                // file received the afferent counts, so the *metric* changed
+                // between runs, not just the row order. Pick the
+                // lowest file path instead, which is a property of the source.
+                //
+                // This does not change the documented approximation that a
+                // colliding (name, type) resolves to one file; it only makes
+                // the choice reproducible.
+                name_to_file
+                    .entry((name, ntype))
+                    .and_modify(|existing| {
+                        if fp < *existing {
+                            existing.clone_from(&fp);
+                        }
+                    })
+                    .or_insert(fp);
             }
         }
     }
@@ -121,8 +140,21 @@ pub async fn calculate_file_coupling(
         })
         .collect();
 
-    // Sort by total coupling (Ca + Ce) descending
-    results.sort_by_key(|b| std::cmp::Reverse(b.afferent + b.efferent));
+    // Total coupling descending, then file path, which is unique per row
+    // and therefore makes this a total order.
+    //
+    // The bare `sort_by_key` this replaces had two problems at once, and the
+    // second is the one that bit. Rows arrive in hash-map order, so ties were
+    // ordered by chance; and because `truncate` runs straight after, a tie
+    // straddling the cut changed *which files came back at all*, not merely
+    // their order. `codegraph context` regenerates this list, so an unchanged
+    // repository produced a `.codegraph/context.md` that diffed against
+    // itself run to run.
+    results.sort_by(|a, b| {
+        (b.afferent + b.efferent)
+            .cmp(&(a.afferent + a.efferent))
+            .then_with(|| a.file_path.cmp(&b.file_path))
+    });
     results.truncate(limit);
 
     Ok(results)

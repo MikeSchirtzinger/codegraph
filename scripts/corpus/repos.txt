@@ -1,0 +1,35 @@
+# Corpus for the run-anywhere validation.
+#
+# Pipe-delimited, 6 fields. Blank lines and lines starting with # are ignored.
+#
+#   name              short id, also the checkout directory name under the corpus dir
+#   language_mix      human label for the receipt table
+#   url               git clone URL (https, public, no auth needed)
+#   sha_at_survey     the commit this corpus was surveyed and measured against on
+#                     2026-09-14. run.sh does NOT pin clones to this SHA: a fresh
+#                     clone of a repo not already present on disk gets whatever is
+#                     at the tip of the default branch that day. This column exists
+#                     so every number in the receipt can be attributed to an exact
+#                     tree, not so re-runs are bit-identical years later. To force a
+#                     fresh clone, delete the repo's directory under the corpus dir.
+#   probe_symbol      optional. If set, run.sh runs an extra
+#                     `query --kind search --name <probe_symbol>` after indexing,
+#                     to prove a specific real symbol made it into the graph.
+#   ignore_probe_dir  optional. If set, run.sh plants a canary Python file at
+#                     <repo>/<ignore_probe_dir>/codegraph_l5_ignore_probe.py before
+#                     the first index, defining codegraph_l5_probe_function, then
+#                     searches for that function after indexing. A hit means a
+#                     directory matching this name got indexed despite being the
+#                     kind of path .gitignore convention excludes.
+#
+# name|language_mix|url|sha_at_survey|probe_symbol|ignore_probe_dir
+go|Go|https://github.com/gin-gonic/gin|dcaa4296d111981ffb31ac3eba90bb63e1eb5ab9||
+pyvendor|Python (vendored tree)|https://github.com/pypa/pip|2b28a816d043826f2ba10ff1d22ec3d94d2ed7c5|exit_cacert_ctx|__pycache__
+tsmono|TypeScript (pnpm workspace)|https://github.com/vitejs/vite|99bd9d1d46153fa939f4a304cc0177db42e28776||
+jsx|JavaScript/JSX (React components)|https://github.com/airbnb/react-dates|b7bad38dcff024d374ee98f972b55b3de9e61289|SingleDatePicker|
+java|Java|https://github.com/square/retrofit|e27d855b7b029e7f907dfc52205fdb3e9c603c16||
+c|C|https://github.com/libuv/libuv|096a02d14cb9d3de6d55a29ec02c4dfcb7643c7f||
+cpp|C++|https://github.com/fmtlib/fmt|3a0661d7c03a81e63acb75836c3139a2e4ecd725||
+rust|Rust|https://github.com/tokio-rs/tokio|6276684c288d8e513410219fa2129c69df41af18||
+poly|Polyglot (Rust, C, TypeScript/JS, Python)|https://github.com/tree-sitter/tree-sitter|1b8407d1e718f2a26e2886c03cc55622d8d1d7bd||
+unsup|Ruby (mostly unsupported languages)|https://github.com/sinatra/sinatra|cb22afd7902b566b6eaba6c4ea89739494a65d12||

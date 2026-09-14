@@ -20,6 +20,7 @@ pub mod circular;
 pub mod clones;
 pub mod coupling;
 pub mod dependencies;
+pub mod explain;
 pub mod hub_nodes;
 pub mod search;
 

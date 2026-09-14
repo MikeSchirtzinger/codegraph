@@ -1,0 +1,14 @@
+version: 1
+project: fixture-project
+planes:
+  - id: only
+    title: Only
+    status: active
+    horizon: now
+    items:
+      - id: T-1
+        title: Bad selector
+        kind: feature
+        status: planned
+        touches:
+          - module: src/a.rs

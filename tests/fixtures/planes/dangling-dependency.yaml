@@ -1,0 +1,15 @@
+version: 1
+project: fixture-project
+planes:
+  - id: only
+    title: Only
+    status: active
+    horizon: now
+    items:
+      - id: D-1
+        title: Depends on a ghost
+        kind: feature
+        status: planned
+        depends_on: [D-404]
+        touches:
+          - file: src/a.rs

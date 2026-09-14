@@ -1,0 +1,48 @@
+# A valid two-plane roadmap exercising every selector, both enum sets, a
+# real dependency edge, and the optional fields. The schema tests treat this
+# as the reference document: anything that parses here must keep parsing.
+version: 1
+project: fixture-project
+planes:
+  - id: run-anywhere
+    title: Run codegraph on any codebase
+    status: active
+    horizon: now
+    summary: One command, sensible defaults, honest errors.
+    items:
+      - id: RA-0
+        title: Scaffold the codegraph directory
+        kind: feature
+        status: done
+        touches:
+          - file: src/init.rs
+      - id: RA-1
+        title: Default the project id instead of requiring it
+        kind: feature
+        status: planned
+        touches:
+          - file: src/cli.rs
+          - symbol: Commands::Index
+          - glob: "src/index/**"
+        depends_on: [RA-0]
+        spec: specs/resolution-layer-v1.md
+        notes: Free-form. Anything an agent picking this up needs to know.
+
+  - id: planes-core
+    title: The roadmap as hyperedges over the code
+    status: planned
+    horizon: next
+    items:
+      - id: PC-1
+        title: Ingest the planes file and resolve every touch
+        kind: feature
+        status: planned
+        touches:
+          - file: src/plan/ops.rs
+        depends_on: [RA-1]
+      - id: PC-2
+        title: Park the exporter work
+        kind: docs
+        status: abandoned
+        touches:
+          - glob: "src/**/*.rs"

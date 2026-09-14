@@ -35,7 +35,7 @@ struct RegistryRow {
 pub async fn print_stats(db: &Surreal<Any>, project_id: &str) -> Result<()> {
     let pid = project_id.to_string();
 
-    println!("Codegraph Statistics — project '{project_id}'");
+    println!("Codegraph Statistics for project '{project_id}'");
     println!("============================================");
 
     // Project registry row (written at the end of every `index` run).
@@ -54,7 +54,7 @@ pub async fn print_stats(db: &Surreal<Any>, project_id: &str) -> Result<()> {
             println!("  Last indexed:  {ts}");
         }
     } else {
-        println!("  (no project_registry entry — run `codegraph index` first)");
+        println!("  (no project_registry entry: run `codegraph index` first)");
     }
     println!();
 

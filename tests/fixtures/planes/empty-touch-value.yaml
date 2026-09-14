@@ -1,0 +1,14 @@
+version: 1
+project: fixture-project
+planes:
+  - id: only
+    title: Only
+    status: active
+    horizon: now
+    items:
+      - id: V-1
+        title: Touch with no target
+        kind: feature
+        status: planned
+        touches:
+          - file: ""

@@ -13,6 +13,7 @@ use surrealdb::engine::any::Any;
 use surrealdb::Surreal;
 
 use crate::graph::dependencies::{self, DependencyResult};
+use crate::graph::explain::{self, Chain, DeletedSymbol, ExplainGraph, Membership};
 use crate::graph::NAME_EDGE_TYPES;
 
 /// Traversal depth every facade query uses. Not exposed as a parameter (§3.1
@@ -60,6 +61,23 @@ pub struct StructuralVerdict {
     /// populated graph where the touched files define no symbols is a real,
     /// empty-but-valid verdict, not a skip.
     pub graph_empty: bool,
+
+    /// Machine-checkable evidence chains for the findings above, present
+    /// only when explain was asked for (`specs/explain-v1.md`). `None` is
+    /// "not requested"; `Some([])` is "requested, and there was nothing to
+    /// explain" — a distinction a consumer needs, which is why this is an
+    /// `Option` rather than a bare `Vec`.
+    ///
+    /// Skipped entirely when absent, so a verdict produced with explain off
+    /// serializes to exactly the bytes it did before this field existed.
+    /// `tests/explain.rs::json_shape_is_unchanged_when_explain_is_off`
+    /// pins that against the pre-change output, byte for byte.
+    ///
+    /// Explanations never change a verdict. The decision is the same pure
+    /// function of the same findings it was before; this field only shows
+    /// the derivation behind findings that were already there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explanations: Option<Vec<Chain>>,
 }
 
 impl StructuralVerdict {
@@ -367,7 +385,156 @@ pub async fn impact_verdict_for_paths(
         name_ambiguous,
         matched_symbols,
         graph_empty,
+        explanations: None,
     })
+}
+
+// ============================================================================
+// explain-v1 — evidence chains beside the verdict (ADDITIVE ONLY; nothing
+// above this line changed except the optional `explanations` field, which
+// is skipped when absent)
+// ============================================================================
+
+/// [`impact_verdict_for_paths`], with a machine-checkable evidence chain
+/// behind every finding (`specs/explain-v1.md`).
+///
+/// The verdict half is produced by calling `impact_verdict_for_paths`
+/// itself, unmodified, so explain cannot drift from the decision it
+/// explains: same query, same findings, same booleans. Chains are then
+/// attached for the same symbol set that verdict was built from, which is
+/// what makes "a chain per finding" true by construction rather than by
+/// coincidence.
+///
+/// Every chain is verifiable with
+/// [`crate::graph::explain::verify_chain`] against an
+/// [`ExplainGraph`] loaded from this same store. Callers handing a report
+/// to someone who should not have to trust them are expected to say so.
+pub async fn explain_verdict_for_paths(
+    store: &Store,
+    paths: &[String],
+) -> Result<StructuralVerdict, FacadeError> {
+    let mut verdict = impact_verdict_for_paths(store, paths).await?;
+
+    let graph = ExplainGraph::load(&store.db, &store.project_id)
+        .await
+        .map_err(|e| FacadeError::Query(e.to_string()))?;
+
+    // The same two name sets `impact_verdict_for_paths` queried, recovered
+    // the same way, so a chain exists for exactly the symbols it looked at.
+    let touched = touched_symbol_names(&store.db, &store.project_id, paths).await?;
+    let deleted = deleted_symbol_rows(&store.db, &store.project_id, paths, &touched).await?;
+
+    let mut chains = Vec::new();
+    for name in &touched {
+        chains.extend(explain::explain_symbol(
+            &graph,
+            &store.project_id,
+            name,
+            &Membership::ExplicitSymbol,
+        ));
+    }
+    for row in &deleted {
+        // A deleted name's membership link is its deletion record, not a
+        // literal argument — that is the whole point of S.1.
+        chains.extend(explain::explain_symbol(
+            &graph,
+            &store.project_id,
+            &row.name,
+            &Membership::Deleted(row.clone()),
+        ));
+    }
+
+    verdict.explanations = Some(chains);
+    Ok(verdict)
+}
+
+/// [`impact_verdict`], with evidence chains. The symbol was named
+/// literally by the caller, so every chain's S.1 link is
+/// [`Membership::ExplicitSymbol`].
+pub async fn explain_verdict(
+    store: &Store,
+    symbol: &str,
+) -> Result<StructuralVerdict, FacadeError> {
+    let mut verdict = impact_verdict(store, symbol).await?;
+    verdict.explanations =
+        Some(explain_chains_for_symbol(&store.db, &store.project_id, symbol).await?);
+    Ok(verdict)
+}
+
+/// Chains for one symbol, for a caller that already holds its own
+/// connection and does not want a second one.
+///
+/// Exists for the same reason [`is_indexed_conn`] and
+/// [`project_dependency_result`] do: the CLI's `--json` path runs in the
+/// binary crate with `client` already open, and opening a second connection
+/// to the same embedded surrealkv store deadlocks on its single-writer file
+/// lock. This is the function `codegraph query --kind rdeps --explain`
+/// calls.
+pub async fn explain_chains_for_symbol(
+    db: &Surreal<Any>,
+    project_id: &str,
+    symbol: &str,
+) -> Result<Vec<Chain>, FacadeError> {
+    let graph = ExplainGraph::load(db, project_id)
+        .await
+        .map_err(|e| FacadeError::Query(e.to_string()))?;
+    Ok(explain::explain_symbol(
+        &graph,
+        project_id,
+        symbol,
+        &Membership::ExplicitSymbol,
+    ))
+}
+
+/// [`deleted_symbol_names`], keeping the whole row rather than just the
+/// name. A chain's S.1 link is the deletion record itself — qualified name,
+/// node type and file path, all three re-checkable against
+/// `deleted_symbol` — so the name alone is not enough to build one.
+async fn deleted_symbol_rows(
+    db: &Surreal<Any>,
+    project_id: &str,
+    paths: &[String],
+    touched: &[String],
+) -> Result<Vec<DeletedSymbol>, FacadeError> {
+    let mut resp = db
+        .query(
+            "SELECT name, qualified_name, node_type, file_path FROM deleted_symbol \
+             WHERE project_id = $pid AND file_path IN $paths",
+        )
+        .bind(("pid", project_id.to_string()))
+        .bind(("paths", paths.to_vec()))
+        .await
+        .map_err(|e| FacadeError::Query(e.to_string()))?;
+    let rows: Vec<surrealdb_types::Value> =
+        resp.take(0).map_err(|e| FacadeError::Query(e.to_string()))?;
+
+    let live: std::collections::HashSet<&str> = touched.iter().map(String::as_str).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for v in &rows {
+        let surrealdb_types::Value::Object(obj) = v else {
+            continue;
+        };
+        let name = crate::graph::get_str(obj, "name");
+        if name.is_empty() || live.contains(name.as_str()) {
+            continue;
+        }
+        let row = DeletedSymbol {
+            name,
+            qualified_name: crate::graph::get_str(obj, "qualified_name"),
+            node_type: crate::graph::get_str(obj, "node_type"),
+            file_path: crate::graph::get_str(obj, "file_path"),
+        };
+        if seen.insert(row.clone()) {
+            out.push(row);
+        }
+    }
+    // `deleted_symbol` rows carry no useful intrinsic order, and chains are
+    // a diffable artifact — sort so two runs agree.
+    out.sort_by(|a, b| {
+        (&a.name, &a.qualified_name, &a.file_path).cmp(&(&b.name, &b.qualified_name, &b.file_path))
+    });
+    Ok(out)
 }
 
 /// Design doc §3.3 step 1: the touched symbols for a set of (index-relative)
@@ -515,6 +682,7 @@ pub fn project_dependency_result(
         name_ambiguous: dep_result.name_ambiguous,
         matched_symbols,
         graph_empty,
+        explanations: None,
     }
 }
 

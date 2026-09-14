@@ -1,7 +1,12 @@
 /target
-.codegraph/
+.codegraph/*
+!.codegraph/planes.yaml
+!.codegraph/config.toml
 .codegraph.stale-*/
 .DS_Store
 
 # surreal CLI scratch history
 history.txt
+
+# scripts/corpus/run.sh output: per-run logs and tables, regenerate freely
+scripts/corpus/out/

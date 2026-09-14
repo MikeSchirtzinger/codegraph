@@ -12,8 +12,10 @@ pub mod qualified_name;
 pub mod resolve;
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::io::{IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use surrealdb::engine::any::Any;
@@ -32,6 +34,18 @@ pub enum IndexingTier {
     Balanced,
     /// + references, type annotations, all edges. Slowest but most complete.
     Full,
+}
+
+impl IndexingTier {
+    /// The spelling `--tier` accepts, so a message about the tier can be
+    /// pasted straight back onto a command line.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IndexingTier::Fast => "fast",
+            IndexingTier::Balanced => "balanced",
+            IndexingTier::Full => "full",
+        }
+    }
 }
 
 impl std::str::FromStr for IndexingTier {
@@ -55,6 +69,274 @@ pub struct IndexConfig {
     pub force: bool,
 }
 
+// ============================================================================
+// Progress reporting
+// ============================================================================
+//
+// Before this existed, `index` wrote three log lines for an entire run. On a
+// 279-file C repository that is 8.6 minutes of silence, which reads as a
+// hang, not as work. Everything below exists to turn that silence into a
+// line a human or an agent can act on, and it is hand-rolled rather than
+// pulled from a progress-bar crate because the whole requirement is two
+// writers and a clock.
+//
+// Output goes to stderr, next to the tracing lines and away from the
+// machine-readable stdout every `--json` path writes to.
+
+/// How progress is rendered. Resolved once per run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressStyle {
+    /// One line, rewritten in place. Chosen when stderr is a terminal.
+    InPlace,
+    /// One appended line per update, at a lower cadence. Chosen when stderr
+    /// is a pipe or a file, which is what an agent, a CI job, and `2> log`
+    /// all are. Rewriting a line in place there produces a wall of carriage
+    /// returns nobody can read.
+    Plain,
+    /// Nothing is written.
+    Off,
+}
+
+impl ProgressStyle {
+    /// Decide the style for this run.
+    ///
+    /// `CODEGRAPH_PROGRESS` overrides the terminal check and accepts
+    /// `tty`, `plain`, `off`, and `auto`. An unrecognized value falls back
+    /// to `auto` rather than failing the run: progress is reporting, and
+    /// reporting must never be the reason an index does not happen.
+    pub fn detect() -> Self {
+        match std::env::var("CODEGRAPH_PROGRESS")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "tty" => ProgressStyle::InPlace,
+            "plain" => ProgressStyle::Plain,
+            "off" | "none" | "0" => ProgressStyle::Off,
+            _ => {
+                if std::io::stderr().is_terminal() {
+                    ProgressStyle::InPlace
+                } else {
+                    ProgressStyle::Plain
+                }
+            }
+        }
+    }
+}
+
+/// Whether a per-file progress line is due.
+///
+/// Pure, and separated out so the cadence is testable without a clock or a
+/// terminal. The file thresholds are the "every N files" half of the rule
+/// and the durations are the "or every T seconds" half, whichever comes
+/// first. The 100 ms floor on the in-place path is the one addition: 25
+/// files can go by in a millisecond on a warm cache, and a terminal
+/// repainted a thousand times a second is worse than no progress at all.
+pub fn progress_tick_due(
+    style: ProgressStyle,
+    files_since_last: usize,
+    since_last: Duration,
+) -> bool {
+    match style {
+        ProgressStyle::Off => false,
+        ProgressStyle::InPlace => {
+            (files_since_last >= 25 && since_last >= Duration::from_millis(100))
+                || since_last >= Duration::from_secs(2)
+        }
+        ProgressStyle::Plain => {
+            files_since_last >= 500 || since_last >= Duration::from_secs(10)
+        }
+    }
+}
+
+/// Phase timer and progress writer for one indexing run.
+pub struct Progress {
+    style: ProgressStyle,
+    run_started: Instant,
+    phase_started: Instant,
+    phase_name: Option<String>,
+    /// Completed phases, in order, with the wall time each took.
+    phases: Vec<(String, Duration)>,
+    last_tick: Instant,
+    last_tick_files: usize,
+    /// True when an in-place line is on screen and has to be cleared before
+    /// anything else is written.
+    line_open: bool,
+}
+
+impl Progress {
+    /// A reporter for this run, with the style auto-detected.
+    pub fn new() -> Self {
+        Self::with_style(ProgressStyle::detect())
+    }
+
+    /// A reporter with the style forced. Used by the tests.
+    pub fn with_style(style: ProgressStyle) -> Self {
+        let now = Instant::now();
+        Progress {
+            style,
+            run_started: now,
+            phase_started: now,
+            phase_name: None,
+            phases: Vec::new(),
+            last_tick: now,
+            last_tick_files: 0,
+            line_open: false,
+        }
+    }
+
+    /// Wall time since the run started.
+    pub fn elapsed(&self) -> Duration {
+        self.run_started.elapsed()
+    }
+
+    /// Write one standalone line, outside any phase. Used for the tier
+    /// notice at the top of a run.
+    pub fn note(&mut self, text: &str) {
+        self.emit(&format!("[codegraph] {text}"), false);
+    }
+
+    /// Close the phase in flight, if any, and open a new one.
+    pub fn phase(&mut self, name: &str) {
+        self.close_phase();
+        self.phase_started = Instant::now();
+        self.last_tick = self.phase_started;
+        self.last_tick_files = 0;
+        self.phase_name = Some(name.to_string());
+        let at = self.run_started.elapsed();
+        self.emit(
+            &format!("[codegraph] {name} starting at {}", secs(at)),
+            false,
+        );
+    }
+
+    /// Report progress within the current phase. Rate-limited by
+    /// [`progress_tick_due`]; call it once per file and let it decide.
+    pub fn tick(&mut self, done: usize, total: usize) {
+        if self.style == ProgressStyle::Off {
+            return;
+        }
+        let since_last = self.last_tick.elapsed();
+        let files_since_last = done.saturating_sub(self.last_tick_files);
+        if !progress_tick_due(self.style, files_since_last, since_last) {
+            return;
+        }
+        self.last_tick = Instant::now();
+        self.last_tick_files = done;
+        self.emit(&self.render_tick(done, total), true);
+    }
+
+    /// The per-file line. Split out so it can be rendered without writing.
+    fn render_tick(&self, done: usize, total: usize) -> String {
+        let elapsed = self.phase_started.elapsed();
+        let rate = if elapsed.as_secs_f64() > 0.0 {
+            done as f64 / elapsed.as_secs_f64()
+        } else {
+            0.0
+        };
+        let pct = if total > 0 {
+            100.0 * done as f64 / total as f64
+        } else {
+            0.0
+        };
+        format!(
+            "[codegraph]   {done}/{total} files ({pct:.0}%), {}, {rate:.1} files/s",
+            secs(elapsed)
+        )
+    }
+
+    /// Close the run: finish the last phase and print the total with the
+    /// per-phase split, so a slow run can be attributed without a rerun.
+    pub fn finish(&mut self) {
+        self.close_phase();
+        if self.style == ProgressStyle::Off {
+            return;
+        }
+        let total = self.run_started.elapsed();
+        let split = self
+            .phases
+            .iter()
+            .map(|(name, d)| format!("{name} {}", secs(*d)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if split.is_empty() {
+            self.emit(&format!("[codegraph] done in {}", secs(total)), false);
+        } else {
+            self.emit(
+                &format!("[codegraph] done in {} ({split})", secs(total)),
+                false,
+            );
+        }
+    }
+
+    /// Record the elapsed time of the phase in flight.
+    fn close_phase(&mut self) {
+        if let Some(name) = self.phase_name.take() {
+            self.phases.push((name, self.phase_started.elapsed()));
+        }
+    }
+
+    /// Write one line to stderr.
+    ///
+    /// `transient` lines are the per-file ticks, which the in-place style
+    /// overwrites and the plain style appends like any other line. A
+    /// non-transient line always terminates whatever was on screen first,
+    /// so a phase header never lands in the middle of a tick.
+    fn emit(&mut self, text: &str, transient: bool) {
+        if self.style == ProgressStyle::Off {
+            return;
+        }
+        let mut err = std::io::stderr().lock();
+        match (self.style, transient) {
+            (ProgressStyle::InPlace, true) => {
+                // \x1b[K clears from the cursor to the end of the line, so a
+                // shorter line cannot leave the tail of a longer one behind.
+                // Only ever written to a real terminal.
+                let _ = write!(err, "\r{text}\x1b[K");
+                let _ = err.flush();
+                self.line_open = true;
+            }
+            (ProgressStyle::InPlace, false) => {
+                if self.line_open {
+                    let _ = write!(err, "\r\x1b[K");
+                    self.line_open = false;
+                }
+                let _ = writeln!(err, "{text}");
+                let _ = err.flush();
+            }
+            (_, _) => {
+                let _ = writeln!(err, "{text}");
+                let _ = err.flush();
+            }
+        }
+    }
+}
+
+impl Default for Progress {
+    fn default() -> Self {
+        Progress::new()
+    }
+}
+
+impl Drop for Progress {
+    /// A run that ends early (an error out of a phase) must not leave a
+    /// half-written in-place line on the terminal for the shell prompt to
+    /// land in the middle of.
+    fn drop(&mut self) {
+        if self.line_open {
+            let mut err = std::io::stderr().lock();
+            let _ = writeln!(err, "\r\x1b[K");
+            let _ = err.flush();
+        }
+    }
+}
+
+/// Format a duration the way every line here formats one.
+fn secs(d: Duration) -> String {
+    format!("{:.1}s", d.as_secs_f64())
+}
+
 /// Result of an indexing run.
 #[derive(Debug, Default)]
 pub struct IndexResult {
@@ -74,6 +356,12 @@ pub struct IndexResult {
     /// resolution — fingerprints read RESOLVED bindings). See
     /// `index::fingerprint`.
     pub fingerprints: fingerprint::FingerprintStats,
+    /// Which file-discovery strategy produced the candidate list. Reported
+    /// because "why is that file in my graph" and "why is it not" are both
+    /// answered by this one fact.
+    pub discovery: DiscoveryStrategy,
+    /// Wall time for the whole run.
+    pub elapsed: Duration,
 }
 
 /// Run the generic indexer on a codebase.
@@ -83,6 +371,19 @@ pub async fn index_project(db: &Arc<Surreal<Any>>, config: &IndexConfig) -> Resu
         .canonicalize()
         .with_context(|| format!("cannot resolve path: {}", config.root_path.display()))?;
 
+    // `index <file>` used to succeed as a zero-file run: the walk of a file
+    // yields the file itself, `filter_entry` never fires, and the result was
+    // an empty graph reported as a success. Refuse it by name instead, and
+    // say what to type.
+    if root.is_file() {
+        let dir = root.parent().unwrap_or(Path::new("."));
+        anyhow::bail!(
+            "{} is a file, and codegraph indexes directories. Point it at the directory that contains the file instead:\n  codegraph index {}",
+            root.display(),
+            dir.display()
+        );
+    }
+
     tracing::info!(
         project_id = %config.project_id,
         root = %root.display(),
@@ -91,13 +392,34 @@ pub async fn index_project(db: &Arc<Surreal<Any>>, config: &IndexConfig) -> Resu
     );
 
     let mut result = IndexResult::default();
+    let mut progress = Progress::new();
+
+    // The tier decides how much of the graph exists at all, and it has
+    // always defaulted to the slowest one without saying so. Say so.
+    progress.note(&format!(
+        "tier {}. Lighter tiers exist: --tier fast indexes definitions only, --tier balanced adds call edges",
+        config.tier.as_str()
+    ));
 
     // 1. Discover source files
-    let source_files = discover_source_files(&root, config.languages.as_deref());
+    progress.phase("discovery");
+    let discovered = discover_source_files(&root, config.languages.as_deref());
+    let source_files = discovered.files;
+    result.discovery = discovered.strategy;
     result.files_scanned = source_files.len();
-    tracing::info!(files = source_files.len(), "discovered source files");
+    tracing::info!(
+        files = source_files.len(),
+        strategy = %result.discovery.describe(),
+        "discovered source files"
+    );
+    progress.note(&format!(
+        "  {} source files found by {}",
+        source_files.len(),
+        result.discovery.describe()
+    ));
 
     // 2. Determine which files need (re-)indexing
+    progress.phase("change detection");
     let changes = if config.force {
         source_files
             .iter()
@@ -157,6 +479,7 @@ pub async fn index_project(db: &Arc<Surreal<Any>>, config: &IndexConfig) -> Resu
     let mut live_keys: Vec<Vec<String>> = Vec::new();
 
     // 3. Clean up deleted files
+    progress.phase("parse+store");
     for path in &deleted {
         let rel = path.strip_prefix(&root).unwrap_or(path);
         let rel_str = rel.to_string_lossy();
@@ -191,7 +514,9 @@ pub async fn index_project(db: &Arc<Surreal<Any>>, config: &IndexConfig) -> Resu
     }
 
     // 4. Parse and store each file.
-    for path in &to_index {
+    let to_index_total = to_index.len();
+    for (done, path) in to_index.iter().enumerate() {
+        progress.tick(done, to_index_total);
         let rel = path.strip_prefix(&root).unwrap_or(path);
         let rel_str = rel.to_string_lossy().to_string();
 
@@ -276,6 +601,12 @@ pub async fn index_project(db: &Arc<Surreal<Any>>, config: &IndexConfig) -> Resu
         }
     }
 
+    // One last line so the phase ends on "all of them", not on whatever
+    // count the rate limiter happened to stop at.
+    progress.note(&format!(
+        "  {to_index_total}/{to_index_total} files parsed and stored"
+    ));
+
     // 4b. Deletion-tracking write-back (design doc §10 option 1). On
     // `--force`, wipe instead: a force run re-baselines "what exists"
     // without diffing (no `detect_changes`), so carrying deletion history
@@ -304,6 +635,12 @@ pub async fn index_project(db: &Arc<Surreal<Any>>, config: &IndexConfig) -> Resu
     // project-wide edges whose to_name matches a changed symbol name,
     // leaving every other edge's binding and resolution_gen untouched. See
     // `specs/resolution-layer-v1.md` §"Incremental re-resolution".
+    // `file_ref` derivation is a sub-step inside the resolver pass, not a
+    // phase this function can bracket: both `resolve_project` and
+    // `resolve_incremental` build it before they return. Its size is
+    // reported in the run summary as `file_refs` instead of as its own
+    // timing.
+    progress.phase("resolve");
     result.resolution = if config.force {
         resolve::resolve_project(db, &config.project_id)
             .await
@@ -318,12 +655,17 @@ pub async fn index_project(db: &Arc<Surreal<Any>>, config: &IndexConfig) -> Resu
     // reads RESOLVED bindings), on BOTH full and incremental paths; on
     // `--force` the pass wipes history first (same degradation contract as
     // the deleted_symbol wipe above). See `index::fingerprint` module docs.
+    progress.phase("fingerprint");
     result.fingerprints = fingerprint::update_fingerprints(db, &config.project_id, config.force)
         .await
         .context("fingerprint pass failed")?;
 
     // 6. Update project registry
+    progress.phase("registry");
     update_project_registry(db, config, &result).await?;
+
+    result.elapsed = progress.elapsed();
+    progress.finish();
 
     tracing::info!(
         files_indexed = result.files_indexed,
@@ -342,8 +684,188 @@ pub async fn index_project(db: &Arc<Surreal<Any>>, config: &IndexConfig) -> Resu
     Ok(result)
 }
 
+/// Which mechanism produced the candidate file list for a run.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DiscoveryStrategy {
+    /// `git ls-files --cached --others --exclude-standard`, run inside the
+    /// walk root. Gives exact gitignore semantics for free: `.gitignore` at
+    /// every level, `.git/info/exclude`, and the user's global excludes
+    /// file, with tracked files always included and ignored files always
+    /// out. Untracked-but-not-ignored files are in, so a file written a
+    /// second ago is indexed without being committed first.
+    Git,
+    /// A directory walk plus the built-in skip list. The fallback.
+    Walk {
+        /// Why git discovery was not used. Printed, because "it indexed my
+        /// build output" and "git is not installed here" are the same
+        /// symptom from the user's side.
+        reason: String,
+    },
+    /// No discovery has run yet. Only ever seen on a default-constructed
+    /// [`IndexResult`].
+    #[default]
+    Unknown,
+}
+
+impl DiscoveryStrategy {
+    /// One short phrase for the log line and the run summary.
+    pub fn describe(&self) -> String {
+        match self {
+            DiscoveryStrategy::Git => {
+                "git ls-files, so .gitignore is respected".to_string()
+            }
+            DiscoveryStrategy::Walk { reason } => {
+                format!("directory walk with the built-in skip list ({reason})")
+            }
+            DiscoveryStrategy::Unknown => "not run".to_string(),
+        }
+    }
+}
+
+/// The candidate source files, and how they were found.
+#[derive(Debug, Clone)]
+pub struct Discovery {
+    /// Absolute paths, in discovery order.
+    pub files: Vec<PathBuf>,
+    /// The mechanism that produced them.
+    pub strategy: DiscoveryStrategy,
+}
+
+/// Directories that are never first-party source, whatever git thinks of
+/// them.
+///
+/// This list predates gitignore support and survives it. A repository that
+/// commits its `vendor/` tree (normal in Go) or its `node_modules` (rare but
+/// real) is tracked by git and would otherwise be pulled in as the project's
+/// own code, which is both wrong and the difference between a 30-second
+/// index and a 30-minute one. Keeping it applied on both discovery paths
+/// also means turning gitignore support on cannot widen what gets indexed,
+/// only narrow it.
+fn is_skipped_dir(name: &str) -> bool {
+    name.starts_with('.')
+        || name == "node_modules"
+        || name == "target"
+        || name == "build"
+        || name == "dist"
+        || name == "vendor"
+        || name == "__pycache__"
+}
+
+/// True when this path is a language codegraph can parse and passes the
+/// `--languages` filter.
+fn wanted_source_file(path: &Path, languages: Option<&[String]>) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let Some(lang) = parser::extension_to_language(ext) else {
+        return false;
+    };
+    match languages {
+        Some(filter) => filter.iter().any(|f| f.eq_ignore_ascii_case(lang)),
+        None => true,
+    }
+}
+
 /// Discover all source files under root, optionally filtered by language.
-fn discover_source_files(root: &Path, languages: Option<&[String]>) -> Vec<std::path::PathBuf> {
+///
+/// Prefers git's own idea of what belongs to the project, and falls back to
+/// walking the tree. The fallback is not a lesser mode: it is what runs on a
+/// plain directory with no repository around it, which is a first-class way
+/// to point codegraph at a codebase.
+pub fn discover_source_files(root: &Path, languages: Option<&[String]>) -> Discovery {
+    match git_tracked_files(root) {
+        Ok(paths) => {
+            let files: Vec<PathBuf> = paths
+                .into_iter()
+                .filter(|rel| {
+                    rel.parent()
+                        .into_iter()
+                        .flat_map(Path::components)
+                        .all(|c| !is_skipped_dir(&c.as_os_str().to_string_lossy()))
+                })
+                .map(|rel| root.join(rel))
+                .filter(|p| wanted_source_file(p, languages))
+                // `--cached` lists files that are in the index but no longer
+                // on disk, and git lists a symlink as an ordinary entry.
+                // `symlink_metadata` rejects both without following a link
+                // out of the tree, which matches what the walk has always
+                // done with `follow_links(false)`.
+                .filter(|p| {
+                    std::fs::symlink_metadata(p)
+                        .map(|m| m.file_type().is_file())
+                        .unwrap_or(false)
+                })
+                .collect();
+
+            // An empty git answer is ambiguous in a way that matters: it is
+            // what a repository with no source files looks like, and it is
+            // also what indexing a directory that is itself gitignored looks
+            // like (a vendored copy under `third_party/`, say). Falling back
+            // costs one directory walk and cannot produce fewer files, so it
+            // is never the wrong side to err on.
+            if files.is_empty() {
+                return walk_source_files(
+                    root,
+                    languages,
+                    "git listed no source files under this path".to_string(),
+                );
+            }
+
+            Discovery {
+                files,
+                strategy: DiscoveryStrategy::Git,
+            }
+        }
+        Err(reason) => walk_source_files(root, languages, reason),
+    }
+}
+
+/// Ask git for every file it considers part of the project under `root`.
+///
+/// `--cached` is the tracked set, `--others` adds untracked files, and
+/// `--exclude-standard` subtracts everything the ignore rules exclude. That
+/// combination is the definition of "files that belong to this project", and
+/// it is exactly the semantics a user means when they ask why their build
+/// output got indexed.
+///
+/// Returns the reason it could not be used on failure, for the log line.
+/// Nothing here is fatal: every failure mode falls through to the walk.
+fn git_tracked_files(root: &Path) -> std::result::Result<Vec<PathBuf>, String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "--cached", "--others", "--exclude-standard", "-z"])
+        .output()
+        .map_err(|e| format!("git could not be run: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let first = stderr.lines().next().unwrap_or("git ls-files failed");
+        return Err(format!("git declined: {}", first.trim()));
+    }
+
+    // Paths come back relative to `root` because of `-C`, NUL-separated
+    // because of `-z`, which is the only encoding that survives a newline in
+    // a filename. A path that is not UTF-8 is dropped rather than lossily
+    // converted, because a lossy path does not open.
+    let mut seen = BTreeSet::new();
+    let mut files = Vec::new();
+    for chunk in output.stdout.split(|b| *b == 0) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(chunk) else {
+            continue;
+        };
+        // During a merge conflict `--cached` lists one path once per stage.
+        if seen.insert(text.to_string()) {
+            files.push(PathBuf::from(text));
+        }
+    }
+    Ok(files)
+}
+
+/// Walk the tree and keep every parsable source file, skipping the
+/// directories in [`is_skipped_dir`].
+fn walk_source_files(root: &Path, languages: Option<&[String]>, reason: String) -> Discovery {
     let mut files = Vec::new();
 
     for entry in walkdir::WalkDir::new(root)
@@ -360,13 +882,7 @@ fn discover_source_files(root: &Path, languages: Option<&[String]>) -> Vec<std::
             // explicitly asked to index. `filter_entry` rejecting the root
             // itself would prune the entire walk to nothing.
             if e.file_type().is_dir() && e.depth() > 0 {
-                return !name.starts_with('.')
-                    && name != "node_modules"
-                    && name != "target"
-                    && name != "build"
-                    && name != "dist"
-                    && name != "vendor"
-                    && name != "__pycache__";
+                return !is_skipped_dir(&name);
             }
             true
         })
@@ -375,27 +891,16 @@ fn discover_source_files(root: &Path, languages: Option<&[String]>) -> Vec<std::
         if !entry.file_type().is_file() {
             continue;
         }
-
-        let path = entry.path();
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-
-        let lang = parser::extension_to_language(ext);
-        if lang.is_none() {
+        if !wanted_source_file(entry.path(), languages) {
             continue;
         }
-
-        // Apply language filter if specified
-        if let Some(filter) = languages {
-            let lang_name = lang.unwrap();
-            if !filter.iter().any(|f| f.eq_ignore_ascii_case(lang_name)) {
-                continue;
-            }
-        }
-
-        files.push(path.to_path_buf());
+        files.push(entry.path().to_path_buf());
     }
 
-    files
+    Discovery {
+        files,
+        strategy: DiscoveryStrategy::Walk { reason },
+    }
 }
 
 /// Remove all nodes and edges for a file from the project.

@@ -77,6 +77,33 @@ DEFINE FIELD OVERWRITE resolved_by ON code_edge TYPE option<string>;
 DEFINE FIELD OVERWRITE resolution_gen ON code_edge TYPE option<int>;
 DEFINE FIELD OVERWRITE candidates ON code_edge TYPE option<array<string>>;
 
+-- Cascade derivation (explain-v1, `specs/explain-v1.md` §4), written by the
+-- same two resolver passes that write the four fields above.
+--
+-- `resolved_by` names only the rule that *won*. On an UNRESOLVED or
+-- AMBIGUOUS edge no rule won, so these two are the only record of what the
+-- cascade actually did. `graph::explain` builds chain links out of them and
+-- its verifier re-derives them by re-running the cascade, so a row whose
+-- values disagree with the live graph is detectable rather than believed.
+--
+-- `attempted_rules` is every rule the cascade reached, in order, e.g.
+-- `["r1","r2","r2m","r6"]` for a qualified capture nothing matched.
+-- `resolution_outcome` is one of `bound`, `ambiguous`, `no_candidates`,
+-- `no_rule_matched`, `orphan_source`. The middle two of those five are a
+-- distinction a stale-reference finding turns on: `no_candidates` means
+-- nothing in the project answers to the name at all (the renamed-away
+-- regime), while `no_rule_matched` means something does and no rule
+-- admitted it (the qualified-capture regime, e.g. `std::env::args`).
+--
+-- Both `option`, like `resolved_by`: `EXTRACTED` rows (`contains`, same-file
+-- macro `calls`) and derived `file_ref` rows never pass through the
+-- resolver, so they carry neither, and a non-optional type here would reject
+-- them. `code_edge` is SCHEMALESS, so these declarations document and type
+-- the columns rather than admit them; the resolver wrote both successfully
+-- before they existed.
+DEFINE FIELD OVERWRITE attempted_rules ON code_edge TYPE option<array<string>>;
+DEFINE FIELD OVERWRITE resolution_outcome ON code_edge TYPE option<string>;
+
 -- Per-file indexing state for incremental rebuilds
 DEFINE TABLE OVERWRITE file_metadata SCHEMAFULL;
 DEFINE FIELD OVERWRITE project_id ON file_metadata TYPE string;

@@ -1,0 +1,25 @@
+version: 1
+project: fixture-project
+planes:
+  - id: first
+    title: First
+    status: active
+    horizon: now
+    items:
+      - id: DUP-1
+        title: One
+        kind: feature
+        status: planned
+        touches:
+          - file: src/a.rs
+  - id: second
+    title: Second
+    status: active
+    horizon: now
+    items:
+      - id: DUP-1
+        title: Two
+        kind: fix
+        status: planned
+        touches:
+          - file: src/b.rs

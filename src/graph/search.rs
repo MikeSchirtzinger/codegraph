@@ -15,6 +15,11 @@ pub async fn search_nodes(
     node_type: Option<&str>,
     limit: usize,
 ) -> Result<Vec<GraphNode>> {
+    // The ORDER BY in both queries below is load-bearing, not cosmetic: a
+    // LIMIT over an unordered result set means *which* matches come back
+    // depends on storage order, which is not stable across two indexes of
+    // the same tree. Ordering before the limit is the only way the same
+    // search returns the same symbols twice.
     let pid = project_id.to_string();
     let _pattern = format!("%{query}%");
     let limit_i = limit as i64;
@@ -24,6 +29,7 @@ pub async fn search_nodes(
             "SELECT node_id, name, node_type, file_path, language, start_line
              FROM code_node
              WHERE project_id = $pid AND name CONTAINS $q AND node_type = $ntype
+             ORDER BY file_path, name, node_id
              LIMIT $lim",
         )
         .bind(("pid", pid))
@@ -37,6 +43,7 @@ pub async fn search_nodes(
             "SELECT node_id, name, node_type, file_path, language, start_line
              FROM code_node
              WHERE project_id = $pid AND name CONTAINS $q AND node_type != 'import'
+             ORDER BY file_path, name, node_id
              LIMIT $lim",
         )
         .bind(("pid", pid))

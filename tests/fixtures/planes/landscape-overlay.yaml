@@ -1,0 +1,74 @@
+# Roadmap fixture for the landscape overlay tests (lane L3).
+#
+# Every touch is written against `tests/fixtures/go`, whose own ground truth
+# lives in `../go/expected.yaml`. That pairing is the point: the overlay is
+# only meaningful if a planned touch lands on the same subsystem the code
+# half of the landscape drew, so the two fixtures have to describe the same
+# tree.
+#
+# What each item is here to prove:
+#
+# | Item | Status | Proves |
+# |---|---|---|
+# | LS-1 | active | a `file:` and a `symbol:` touch both land on `db` |
+# | LS-2 | planned | a `glob:` touch expands to every file under `handler` |
+# | LS-3 | done | finished work is omitted from the brief |
+# | LS-4 | abandoned | dropped work is omitted from the brief |
+# | LS-5 | planned | a touch naming a path no subsystem covers is reported, not dropped |
+#
+# LS-4 and LS-5 sit in a `planned` plane, so the brief's roadmap section
+# skips the whole plane; LS-5's unplaced touch is still reported, because an
+# unplaceable touch is a fact about the plan regardless of which plane it
+# sits in.
+version: 1
+project: landscape-overlay
+planes:
+  - id: shipping
+    title: Work in flight on the go fixture
+    status: active
+    horizon: now
+    summary: Two live items and one landed one.
+    items:
+      - id: LS-1
+        title: Widen the database connector
+        kind: feature
+        status: active
+        touches:
+          - file: db/db.go
+          - symbol: Connect
+        spec: specs/resolution-layer-v1.md
+
+      - id: LS-2
+        title: Split the handler package
+        kind: refactor
+        status: planned
+        touches:
+          - glob: "handler/**"
+        depends_on: [LS-1]
+
+      - id: LS-3
+        title: Land the even odd cycle fix
+        kind: fix
+        status: done
+        touches:
+          - file: evenodd/even.go
+
+  - id: parked
+    title: Parked work
+    status: planned
+    horizon: later
+    items:
+      - id: LS-4
+        title: Rewrite the alpha package
+        kind: refactor
+        status: abandoned
+        touches:
+          - file: alpha/alpha.go
+
+      - id: LS-5
+        title: Chase a path nothing covers
+        kind: research
+        status: planned
+        touches:
+          - file: docs/nowhere/absent.md
+          - symbol: NoSuchSymbolExistsAnywhere

@@ -1,0 +1,82 @@
+# Roadmap fixture for tests/plan_ops.rs, written against tests/fixtures/rust.
+#
+# Every touch here is chosen for a specific verdict, and the verdicts are
+# facts about that fixture recorded in its own expected.yaml:
+#
+#   src/main.rs                  exists and is indexed    -> RESOLVED, indexed
+#   helper                       defined in alpha.rs AND beta.rs (case c)
+#                                                         -> AMBIGUOUS
+#   no_such_function_anywhere    defined nowhere          -> UNRESOLVED
+#   src/does_not_exist.rs        on neither disk nor index-> UNRESOLVED
+#   Cargo.toml                   on disk, no grammar for it
+#                                                         -> RESOLVED, not indexed
+#   connect                      one definition, in db/connection.rs
+#                                                         -> RESOLVED
+#   src/db/**                    one indexed file         -> RESOLVED
+#
+# Cargo.toml is the case the confidence vocabulary must not swallow. The
+# file is there, the plan is correct, and the code graph holds nothing for
+# it. That is a bound touch with indexed false, not a stale plan.
+version: 1
+project: plan-ops
+planes:
+  - id: core
+    title: Core plan operations
+    status: active
+    horizon: now
+    summary: The plane the ops tests read.
+    items:
+      - id: OPS-1
+        title: Bind one of every confidence in a single item
+        kind: feature
+        status: active
+        touches:
+          - file: src/main.rs
+          - symbol: helper
+          - symbol: no_such_function_anywhere
+          - file: src/does_not_exist.rs
+          - file: Cargo.toml
+        spec: specs/resolution-layer-v1.md
+        notes: Every confidence and every unresolved reason, in one hyperedge.
+
+      - id: OPS-2
+        title: Collide with OPS-1 on main.rs
+        kind: fix
+        status: active
+        touches:
+          - file: src/main.rs
+          - glob: "src/db/**"
+        depends_on: [OPS-1]
+
+      - id: OPS-3
+        title: Decoy active item that shares nothing
+        kind: refactor
+        status: active
+        touches:
+          - file: src/beta.rs
+
+      - id: OPS-4
+        title: Blast anchor on a symbol with two documented callers
+        kind: perf
+        status: planned
+        touches:
+          - symbol: connect
+
+      - id: OPS-5
+        title: Planned item on main.rs, which must not count as a collision
+        kind: docs
+        status: planned
+        touches:
+          - file: src/main.rs
+
+  - id: parked
+    title: Parked work
+    status: planned
+    horizon: later
+    items:
+      - id: OPS-6
+        title: Whole tree sweep, abandoned
+        kind: docs
+        status: abandoned
+        touches:
+          - glob: "src/**/*.rs"

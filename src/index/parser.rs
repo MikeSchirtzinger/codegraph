@@ -100,7 +100,24 @@ pub fn parse_file(
                 tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
             }
         }
-        "javascript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), // JS is valid TS
+        // `.jsx` carries JSX elements, and the plain TypeScript grammar
+        // parses `<div>` as a comparison against a type argument: the
+        // component's body becomes an error node and every function inside
+        // it disappears from the graph. The TSX grammar is the same
+        // language with JSX enabled, which is what the `.tsx` arm above
+        // already relies on.
+        //
+        // `.mjs` and `.cjs` stay on the plain grammar deliberately. They are
+        // ordinary JavaScript modules, JavaScript is a subset of TypeScript,
+        // and neither extension is conventionally JSX-bearing. Routing them
+        // through TSX would only widen the grammar for no gain.
+        "javascript" => {
+            if ext == "jsx" {
+                tree_sitter_typescript::LANGUAGE_TSX.into()
+            } else {
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
+            }
+        }
         "python" => tree_sitter_python::LANGUAGE.into(),
         "go" => tree_sitter_go::LANGUAGE.into(),
         "java" => tree_sitter_java::LANGUAGE.into(),

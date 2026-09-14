@@ -1,0 +1,25 @@
+# Roadmap fixture for the stale-plan detector end to end.
+#
+# `tests/plan_ops.rs` copies tests/fixtures/rust to a temporary directory,
+# indexes it, and syncs this file: both touches bind. It then renames
+# `log_startup` to `log_boot` in that copy, re-indexes, and syncs again
+# without changing a character of this file. The file touch still binds and
+# the symbol touch flips to UNRESOLVED, which is the whole point of the
+# feature: the plan did not change, the code did, and codegraph says so in
+# the same vocabulary it uses for a stale code reference.
+version: 1
+project: plan-rename
+planes:
+  - id: startup
+    title: Startup logging
+    status: active
+    horizon: now
+    items:
+      - id: RN-1
+        title: Rework the startup log line
+        kind: refactor
+        status: active
+        touches:
+          - file: src/main.rs
+          - symbol: log_startup
+        notes: The symbol touch is the one the rename breaks.

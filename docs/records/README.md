@@ -14,3 +14,5 @@ tree and which have drifted.
 | `e4572d6.md` | Deletion tracking: the incomplete-rename blind spot (sensitivity) |
 | `833c17f.md` | Stale scan mirrors the resolver's own matching rule: 1,015 false positives to 0 (specificity) |
 | `2cf8aeb.md` | Batched node/edge writes: the index throughput fix |
+| `d95bad6.md` | A plan touch whose file exists binds, indexed or not: confidence stops carrying two facts |
+| `3a517b2.md` | Bulk write-back on the incremental resolve path, 10.2x fewer instructions, plus stable query order |

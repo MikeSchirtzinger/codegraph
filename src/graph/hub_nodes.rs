@@ -139,7 +139,20 @@ pub async fn find_hub_nodes(
         }
     }
 
-    hubs.sort_by_key(|h| std::cmp::Reverse(h.total_degree));
+    // Degree alone is not a total order, and the rows above arrive in
+    // whatever order storage hands them back, which is not stable across two
+    // indexes of the same tree. With a bare degree sort, every tie is broken
+    // by insertion order, so the same repo indexed twice can report a
+    // different top-N and a `--limit` can silently include a different
+    // symbol. Break ties on identity instead: file, then name, then node id,
+    // all of which are deterministic functions of the source.
+    hubs.sort_by(|a, b| {
+        b.total_degree
+            .cmp(&a.total_degree)
+            .then_with(|| a.file_path.cmp(&b.file_path))
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.node_id.cmp(&b.node_id))
+    });
     hubs.truncate(limit);
 
     Ok(hubs)

@@ -1,0 +1,29 @@
+version: 1
+project: fixture-project
+planes:
+  - id: only
+    title: Only
+    status: active
+    horizon: now
+    items:
+      - id: C-1
+        title: First
+        kind: feature
+        status: planned
+        depends_on: [C-3]
+        touches:
+          - file: src/a.rs
+      - id: C-2
+        title: Second
+        kind: feature
+        status: planned
+        depends_on: [C-1]
+        touches:
+          - file: src/b.rs
+      - id: C-3
+        title: Third
+        kind: feature
+        status: planned
+        depends_on: [C-2]
+        touches:
+          - file: src/c.rs
