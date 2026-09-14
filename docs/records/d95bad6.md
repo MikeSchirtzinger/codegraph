@@ -2,6 +2,7 @@
 
 Quoted from the private development history with `git show -s d95bad6`.
 
+<!-- credo-lint:allow-fenced verbatim commit message quoted from the private development history -->
 ```
 commit d95bad6047ac5578d211fc871e37ea3fc415c30a
 Author: Mike Schirtzinger <155995654+MikeSchirtzinger@users.noreply.github.com>

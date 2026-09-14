@@ -2,6 +2,7 @@
 
 Quoted from the private development history with `git show -s 2cf8aeb`.
 
+<!-- credo-lint:allow-fenced verbatim commit message quoted from the private development history -->
 ```
 commit 2cf8aeb91587a33fdf30cd7c841c64aa6e5ab0ae
 Author: Mike Schirtzinger <155995654+MikeSchirtzinger@users.noreply.github.com>
