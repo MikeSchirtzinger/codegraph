@@ -798,6 +798,114 @@ async fn the_verifier_catches_a_forged_deletion_record() {
 }
 
 // ============================================================================
+// RF-6, the explain-graph cache
+// ============================================================================
+//
+// `codegraph_verify_chain` used to call `ExplainGraph::load` fresh on every
+// call, which paid the whole project's load cost per chain rather than per
+// index run (RF-6). `ExplainGraphCache` fixes
+// that by caching the loaded graph and reloading it only when
+// `project_registry.last_indexed_at` moves. Two properties matter, and
+// only one of them is "it is faster": a cache that never invalidates would
+// be faster too, and wrong.
+
+/// The performance half: two `get()` calls with no index run between them
+/// must return the exact same loaded graph, not two independent loads that
+/// happen to agree.
+#[tokio::test]
+async fn explain_graph_cache_reuses_the_loaded_graph_when_the_index_is_unchanged() {
+    let db = fresh_db().await.expect("store");
+    index_fixture(&db, "cache-hit", "tests/fixtures/rust")
+        .await
+        .expect("index");
+
+    let cache = explain::ExplainGraphCache::new("cache-hit".to_string());
+    let g1 = cache.get(&db).await.expect("first load");
+    let g2 = cache.get(&db).await.expect("second load");
+
+    assert!(
+        std::sync::Arc::ptr_eq(&g1, &g2),
+        "two get() calls with no index run between them must return the same cached graph, \
+         not reload every time"
+    );
+}
+
+/// The correctness half, and the one that matters more: a cached graph must
+/// never outlive the index run that superseded it.
+///
+/// Builds a stale-reference chain against a project where `orphan_target`
+/// has no live definition, warms the cache, then adds the missing
+/// definition and re-indexes incrementally. The *same* chain, re-checked
+/// through the *same* cache, must now fail: the project it describes no
+/// longer exists. A cache bug that kept serving the pre-reindex graph would
+/// still bless it, which is exactly the failure mode a stale cache would
+/// have and a fresh `ExplainGraph::load` never could.
+#[tokio::test]
+async fn explain_graph_cache_reloads_after_an_incremental_reindex_changes_the_project() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).expect("mkdir");
+    let write = |rel: &str, body: &str| std::fs::write(root.join(rel), body).expect("write");
+    write("src/caller.rs", "pub fn call_it() {\n    orphan_target();\n}\n");
+
+    let db = fresh_db().await.expect("store");
+    index_at(&db, "cache-invalidate", root, true).await;
+
+    let cache = explain::ExplainGraphCache::new("cache-invalidate".to_string());
+    let g1 = cache.get(&db).await.expect("first load");
+    assert!(
+        g1.live_definitions("orphan_target").is_empty(),
+        "the fixture must start with no live definition of orphan_target"
+    );
+
+    let chains = explain::explain_symbol(
+        &g1,
+        "cache-invalidate",
+        "orphan_target",
+        &Membership::ExplicitSymbol,
+    );
+    let chain = first_of(&chains, FindingKind::StaleReference).clone();
+    assert!(
+        explain::verify_chain(&chain, &g1).ok,
+        "the stale-reference chain must verify clean against the pre-reindex graph"
+    );
+
+    // The project changes: a new file defines the symbol the chain claims
+    // has no live definition.
+    write("src/target.rs", "pub fn orphan_target() {}\n");
+    index_at(&db, "cache-invalidate", root, false).await;
+
+    let g2 = cache.get(&db).await.expect("reload after reindex");
+    assert!(
+        !std::sync::Arc::ptr_eq(&g1, &g2),
+        "the cache must not keep serving the pre-reindex graph after an index run"
+    );
+    assert!(
+        !g2.live_definitions("orphan_target").is_empty(),
+        "the new definition must be visible in the reloaded graph"
+    );
+
+    // The decisive check: the same chain, unmodified, re-checked through
+    // the same cache, must now fail.
+    let verdict = explain::verify_chain(&chain, &g2);
+    assert!(
+        !verdict.ok,
+        "a stale-reference chain built before a matching definition was added must fail once \
+         the cache has picked up the reindex, not keep passing against a stale graph"
+    );
+    let failure = verdict
+        .failures()
+        .into_iter()
+        .find(|f| f.fact == "live_definitions")
+        .expect("the live_definitions step should be the one that now disagrees");
+    assert!(
+        failure.reason.as_deref().unwrap_or("").contains("orphan_target"),
+        "expected the live-definitions mismatch to name orphan_target, got {:?}",
+        failure.reason
+    );
+}
+
+// ============================================================================
 // D5 — the facade contract
 // ============================================================================
 

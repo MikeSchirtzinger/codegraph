@@ -1,0 +1,31 @@
+# Roadmap fixture for the module-node exclusion in tests/plan_ops.rs.
+#
+# `utils` is not a symbol anyone defined. It is the basename of a
+# TypeScript file, and since G2 (2026-09-14, specs/receipts/
+# extractor-gaps-20260914.md) a file whose top level runs code carries a
+# synthetic `module` node named after it. A `- symbol:` touch names a
+# definition an author wrote; it must never bind to that node.
+#
+# The test runs this file against two trees:
+#
+#   utils.ts alone, module node only  -> UNRESOLVED, no_such_symbol
+#   plus `function utils` elsewhere   -> RESOLVED, to that function
+#
+# An author who means the file writes `- file: utils.ts`, which is why
+# losing the module node here costs nothing.
+version: 1
+project: plan-module-node
+planes:
+  - id: core
+    title: Module node exclusion
+    status: active
+    horizon: now
+    summary: One symbol touch whose only would-be candidate is synthetic.
+    items:
+      - id: MN-1
+        title: A symbol touch that must not bind to a module node
+        kind: fix
+        status: active
+        touches:
+          - symbol: utils
+        notes: See tests/plan_ops.rs.

@@ -312,7 +312,24 @@ impl TouchIndex {
             // `- symbol: Foo` means the definition of Foo, and counting
             // every file that imports it as a candidate would make almost
             // every symbol touch AMBIGUOUS for no information gain.
-            if s.node_type == "import" {
+            //
+            // A `module` node is excluded for a different reason: it is a
+            // container, not a symbol an author writes. TypeScript's is
+            // synthetic, named after the file, and created for any file
+            // whose top level runs code (G2, `specs/receipts/
+            // extractor-gaps-20260914.md`); Rust's is an inline `mod`
+            // block. Either way `- symbol: utils` would bind to the module
+            // node for `utils.ts` when nothing defines `utils` at all,
+            // turning a visible plan error into a silent pass, and would
+            // make an otherwise clean touch AMBIGUOUS when a real `utils`
+            // does exist elsewhere. An author who means the file writes
+            // `- file: utils.ts`, and one who means a Rust module writes
+            // the path or a glob, so nothing is lost by the exclusion.
+            //
+            // `object` is deliberately *not* excluded. It is a name the
+            // author wrote in source (`export const handlerTool = { … }`),
+            // which is exactly what a `- symbol:` touch is for.
+            if s.node_type == "import" || s.node_type == "module" {
                 continue;
             }
             if !s.qualified_name.is_empty() {

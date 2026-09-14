@@ -722,3 +722,105 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     }
     Ok(())
 }
+
+/// A synthetic `module` node must never satisfy a `- symbol:` touch.
+///
+/// G2 (`specs/receipts/extractor-gaps-20260914.md`) gives every TypeScript
+/// file whose top level runs code a node named after the file. That is a
+/// container, not a definition an author wrote, and the plan resolver keys
+/// its bare-name index on the name alone. Without the exclusion,
+/// `- symbol: utils` binds silently to the module node for `utils.ts` and
+/// an author who named a symbol that does not exist is told their plan is
+/// fine. An author who means the file writes `- file: utils.ts`.
+#[tokio::test]
+async fn a_module_node_never_satisfies_a_symbol_touch() {
+    let project = "plan-module-node";
+    let planes = common::repo_path("tests/fixtures/planes/ops-module-node.yaml");
+    let scratch = tempfile::tempdir().expect("temp dir");
+    let root = scratch.path().join("ts");
+    std::fs::create_dir_all(&root).expect("mkdir");
+    // Top-level code, so `utils.ts` gets a module node named `utils`, and a
+    // real definition in it with a different name so the file is not empty
+    // of symbols either.
+    std::fs::write(
+        root.join("utils.ts"),
+        "export function format(x: string): string {\n  return x.trim();\n}\n\nformat('a');\n",
+    )
+    .expect("write utils.ts");
+
+    let db = common::fresh_db().await.expect("fresh in-memory store");
+    index_at(&db, project, &root).await.expect("index");
+
+    let report = ops::sync(&db, project, &planes).await.expect("sync");
+    assert_eq!(
+        report.selectors_unresolved, 1,
+        "nothing defines `utils`, so the touch must not bind: {report}"
+    );
+    assert_eq!(report.selectors_resolved, 0, "{report}");
+    assert_eq!(
+        report.unresolved_touches[0].touch.reason,
+        Some(UnresolvedReason::NoSuchSymbol),
+        "and the reason must name the real problem: {report}"
+    );
+}
+
+/// The converse, on the same planes file: a real definition of that name
+/// still binds, and the module node does not make it AMBIGUOUS.
+#[tokio::test]
+async fn a_real_definition_still_binds_past_the_module_node() {
+    let project = "plan-module-node";
+    let planes = common::repo_path("tests/fixtures/planes/ops-module-node.yaml");
+    let scratch = tempfile::tempdir().expect("temp dir");
+    let root = scratch.path().join("ts");
+    std::fs::create_dir_all(&root).expect("mkdir");
+    std::fs::write(
+        root.join("utils.ts"),
+        "export function format(x: string): string {\n  return x.trim();\n}\n\nformat('a');\n",
+    )
+    .expect("write utils.ts");
+    // The name the plan means, defined for real, in another file.
+    std::fs::write(
+        root.join("helpers.ts"),
+        "export function utils(): void {\n  return;\n}\n",
+    )
+    .expect("write helpers.ts");
+
+    let db = common::fresh_db().await.expect("fresh in-memory store");
+    index_at(&db, project, &root).await.expect("index");
+
+    let report = ops::sync(&db, project, &planes).await.expect("sync");
+    assert_eq!(
+        report.selectors_resolved, 1,
+        "one definition named `utils`, so exactly one candidate: {report}"
+    );
+    assert_eq!(report.selectors_unresolved, 0, "{report}");
+
+    let show = ops::show(&db, project, "MN-1").await.expect("show");
+    let touch = touch_of(&show, "utils");
+    assert_eq!(touch.confidence, TouchConfidence::Resolved);
+    let bound = touch.to_id.as_deref().expect("a bound node id");
+
+    // It bound to the function, not to the file that shares the name.
+    let nodes = common::load_all_nodes(&db, project)
+        .await
+        .expect("load nodes");
+    let target = nodes
+        .iter()
+        .find(|n| n.node_id == bound)
+        .expect("the bound node is in the store");
+    assert_eq!(target.node_type, "function");
+    assert_eq!(target.file_path, "helpers.ts");
+
+    // And the module node really is there, so the test proves an exclusion
+    // rather than an absence.
+    assert!(
+        nodes
+            .iter()
+            .any(|n| n.name == "utils" && n.node_type == "module"),
+        "utils.ts must still carry its module node: {:?}",
+        nodes
+            .iter()
+            .map(|n| (&n.name, &n.node_type))
+            .collect::<Vec<_>>()
+    );
+}

@@ -46,7 +46,7 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::graph::explain::{self, Chain, ChainVerdict, ExplainGraph};
+use crate::graph::explain::{self, Chain, ChainVerdict};
 
 /// How many evidence chains `codegraph_impact` renders before it truncates.
 ///
@@ -62,6 +62,15 @@ const DEFAULT_EXPLAIN_LIMIT: usize = 10;
 pub struct CodegraphServer {
     db: Arc<Surreal<Any>>,
     project_id: String,
+    /// Caches the graph `codegraph_verify_chain` checks chains against
+    /// (RF-6): an audit calls it once per
+    /// chain against an index that is not moving between calls, so a fresh
+    /// `ExplainGraph::load` per call paid the whole project's load cost on
+    /// every chain. `ExplainGraphCache` shares state across clones of this
+    /// server (it holds an `Arc<Mutex<..>>` internally), so the whole
+    /// session sees one cache, and it invalidates itself whenever the
+    /// project's index watermark moves, see `ExplainGraphCache`'s docs.
+    explain_cache: explain::ExplainGraphCache,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
@@ -285,9 +294,11 @@ impl PlanSyncParams {
 impl CodegraphServer {
     /// Create a new server instance.
     pub fn new(db: Arc<Surreal<Any>>, project_id: String) -> Self {
+        let explain_cache = explain::ExplainGraphCache::new(project_id.clone());
         Self {
             db,
             project_id,
+            explain_cache,
             tool_router: Self::tool_router(),
         }
     }
@@ -391,7 +402,7 @@ matches the graph. There is no include_ambiguous setting, because this tool veri
             Err(e) => return format!("Error: {e}"),
         };
 
-        let graph = match ExplainGraph::load(&self.db, &self.project_id).await {
+        let graph = match self.explain_cache.get(&self.db).await {
             Ok(g) => g,
             Err(e) => return format!("Error: loading the graph to verify against failed: {e}"),
         };

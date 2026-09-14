@@ -693,8 +693,18 @@ Two things the table above hides that are worth calling out explicitly:
 | Go | `function`, `struct`, `interface`, `type_alias`, `import` | `go.rs` |
 | Java | `class`, `interface`, `function`, `enum`, `import` | `java.rs` |
 | Python | `function`, `class`, `import` | `python.rs` |
-| TypeScript/JavaScript | `function`, `class`, `interface`, `type_alias`, `import` | `typescript.rs` |
+| TypeScript/JavaScript | `function`, `class`, `interface`, `type_alias`, `object`, `module`, `import` | `typescript.rs` |
 | C/C++ | `function`, `struct`, `enum`, `class`, `type_alias`, `import` | `c_cpp.rs` |
+
+TypeScript's `object` is a module-level const bound to an object literal,
+which idiomatic TypeScript uses to ship a whole module as one exported
+value. Its `module` is synthetic, one per file, named after the file, and
+created only for a file whose top level runs code: it owns the references
+made by module-scope statements and by callbacks with no enclosing named
+definition, which is where all of a test file's code lives. A `module` node
+is a container rather than a definition, so it is never a candidate for a
+`calls` capture and never satisfies a `- symbol:` roadmap touch; name the
+file instead.
 
 C/C++'s `class` node type is reachable only from `.cpp` files in practice.
 The C tree-sitter grammar has no `class_specifier` node kind, so a `.c` file
@@ -735,11 +745,17 @@ Stated as plainly as the defects that motivated this spec were:
    logical queries against one open store without re-opening it.
 3. **Store-open cost and indexing throughput.** See
    [Performance](#performance) for the full measurement. The *query-side*
-   37,000ms claim (D6) still does not reproduce, but the "tens of
-   milliseconds" figure that originally replaced it has since regressed
-   12–17x, root cause not yet diagnosed (re-measured 2026-07-30 with
-   `scripts/bench/store_open_cost.py`, two independent runs agreeing within
-   ~20%). Indexing's own "high wall time, low CPU" signature, previously
+   37,000ms claim (D6) still does not reproduce. The "tens of
+   milliseconds" figure that originally replaced it regressed 12 to 17x
+   between 2026-07-10 and 2026-07-30 (`scripts/bench/store_open_cost.py`,
+   two independent runs agreeing within ~20%), and that regression is now
+   root-caused and fixed: `codegraph query` had called `db::init_schema`
+   since commit `6b487e4` (2026-07-10), re-running the full schema DDL, 72
+   `DEFINE` statements in `src/schema.surql` plus 47 in
+   `src/schema_plan.surql`, on every invocation. Fixed 2026-09-14 in
+   `284078b`, which records a schema hash on the store and skips the DDL
+   when it matches (`specs/receipts/store-cost-20260914.md`). Indexing's
+   own "high wall time, low CPU" signature, previously
    traced to unbatched per-record writes, **is fixed** (`cg-batch`, commit
    `2cf8aeb`). The scale abort that stood here until 2026-08-08
    (deterministic stack overflow on Rust corpora above ~700–750 files at
@@ -760,10 +776,15 @@ Stated as plainly as the defects that motivated this spec were:
    idempotent `DEFINE` statements before `index_project` starts timing. That
    is a fixed tax per invocation, invisible in any "seconds per file" framing
    because it does not shrink per file, and on a four-file repo it dominates
-   outright. The fix is mechanical and unbuilt: skip the DDL on open when the
-   schema version already matches. The July query-side figure in
-   [Performance](#performance) §1 was not re-measured from an isolated,
-   SHA-pinned build this session, so it stands as published and open.
+   outright. **Fixed the same day** (`284078b`): the store now records a
+   SHA-256 of the schema document and skips the DDL when it matches. Since
+   `db::init_schema` is called by both `index` and `query`, this closes the
+   query-side regression in the paragraph above as the same bug. Measured
+   on an isolated, SHA-pinned build, five interleaved repetitions under
+   concurrent load, medians: `codegraph query --kind summary` warm went
+   1956.2ms to 224.2ms on this repo's `src/`, 1215.4ms to 617.9ms on `cobra`,
+   1071.4ms to 553.0ms on `flask` (`specs/receipts/store-cost-20260914.md`
+   §5, §7).
 4. **No type inference, no overload/trait/dynamic-dispatch resolution, no
    LSP/compiler integration.** Structural + heuristic matching with disclosed
    confidence, by design (`specs/resolution-layer-v1.md`'s Non-goals). Not a
@@ -888,6 +909,12 @@ precise-to-the-millisecond constant.
 | large (`tests/fixtures/`, 70 files) | 50.3ms | 40.2ms |
 | floor (`codegraph --help`, no DB touch) | n/a | 7.4ms median |
 
+The medium row is this repo's own `src/`, which keeps growing: by
+2026-09-14 it was 44 files / 1,387 nodes / 6,817 edges, up from the 28 /
+503 / 3,020 above, so a later medium-row figure is not a clean
+apples-to-apples against this table without accounting for that growth
+(`specs/receipts/store-cost-20260914.md` §7.2).
+
 Measured **2026-07-10**. The method: `src/db.rs::connect`'s existing
 `tracing::info!("Connected to SurrealDB...")` line (fired at the very end of
 opening the embedded engine) is timestamped by the *measuring* process the
@@ -910,9 +937,19 @@ row regressed double-digit-fold. The phase split localizes it to query
 execution, not connecting: for the medium store, `phase_open` is now
 90–186ms while `phase_rest` is **758–857ms**. Most of the regression is
 *after* the store opens, in the query itself, not the connect that
-`idx_ce_from`/`idx_ce_to` was credited with fixing. **Root cause not yet
-identified**. This is a known open regression, not a resolved one, flagged
-as the highest-value follow-up in the verification receipt.
+`idx_ce_from`/`idx_ce_to` was credited with fixing. **Root-caused and fixed
+2026-09-14** (`specs/receipts/store-cost-20260914.md`): since commit
+`6b487e4` (2026-07-10), `codegraph query` called `db::init_schema`, which
+re-ran the full schema DDL, 72 `DEFINE` statements in `src/schema.surql`
+plus 47 in `src/schema_plan.surql`, on every invocation, and that DDL fell
+entirely in `phase_rest`. Fixed in `284078b`, which records a SHA-256 of
+each schema document on the store and skips the DDL when it already
+matches. Measured on an isolated, SHA-pinned build, five interleaved
+repetitions under concurrent load, medians: `codegraph query --kind
+summary` warm went 1956.2ms to 224.2ms on this repo's `src/`, 1215.4ms to
+617.9ms on `cobra`, 1071.4ms to 553.0ms on `flask`. The medium store's
+absolute figures are still not a clean comparison to the July table above;
+see the corpus-growth note there.
 
 **D6's original 37,000ms claim itself still does not reproduce at any store
 size tested**. Even the regressed numbers above complete in under a

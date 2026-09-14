@@ -37,11 +37,13 @@
 //! that is the load-bearing difference from the nearest prior art.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use surrealdb::engine::any::Any;
 use surrealdb::Surreal;
+use tokio::sync::Mutex;
 
 use crate::index::resolve::{
     self, bare_name, language_family, normalize_separators, Indices, ResolverNode, UnresolvedEdge,
@@ -320,6 +322,187 @@ impl ExplainGraph {
         let bare = bare_name(&normalized);
         let family = language_family(from_language);
         self.ids_of(resolve::candidate_pool(&self.indices, bare, to_type, family))
+    }
+}
+
+// ============================================================================
+// Caching (RF-6)
+// ============================================================================
+
+/// `project_registry.last_indexed_at` for one project, or `None` when the
+/// project has never been indexed. Written unconditionally at the end of
+/// every `index` run, full or incremental, changed or not (`index::mod`'s
+/// `update_project_registry` call), which is what makes it a correct,
+/// if conservative, cache key: any index run at all moves it, even a no-op
+/// one, so a cache keyed on it never serves a graph older than the last
+/// completed index. A handful of point-lookup fields, not the join this
+/// module does for `code_node`/`code_edge`/`deleted_symbol`, so it costs a
+/// small fraction of a percent of a full [`ExplainGraph::load`] (measured
+/// on a 17k-node/47k-edge store: about 0.3ms versus about 350ms; see
+/// `specs/receipts/chain-scope-20260914.md`).
+///
+/// Returned as the raw [`surrealdb_types::Value`] rather than converted to a
+/// `String`: the field is a SurrealDB `datetime`, and comparing the raw
+/// value is both simpler and exact, whereas a `datetime`-to-`String`
+/// conversion through the typed `SurrealValue` derive rejects the value
+/// outright (measured: `Failed to convert to none | string: Expected
+/// string, got datetime`) rather than formatting it.
+async fn current_watermark(db: &Surreal<Any>, project_id: &str) -> Result<Option<surrealdb_types::Value>> {
+    let mut resp = db
+        .query("SELECT last_indexed_at FROM project_registry WHERE project_id = $pid")
+        .bind(("pid", project_id.to_string()))
+        .await
+        .context("loading the index watermark failed")?;
+    let rows: Vec<surrealdb_types::Value> = resp.take(0)?;
+    Ok(rows.into_iter().next().and_then(|v| match v {
+        surrealdb_types::Value::Object(obj) => obj.get("last_indexed_at").cloned(),
+        _ => None,
+    }))
+}
+
+/// Caches one project's [`ExplainGraph`], reloading only when
+/// `project_registry.last_indexed_at` has moved since the cached copy was
+/// built.
+///
+/// `codegraph_verify_chain` is called once per chain, and an audit
+/// re-verifies many chains against one index that is not moving between
+/// calls (RF-6): a fresh
+/// [`ExplainGraph::load`] per call pays the whole project's load cost on
+/// every single chain, which is linear in the *project* when the workload's
+/// real axis is the number of *chains*. Measured on a 936-file, 17k-node,
+/// 47k-edge store built from this repo plus a shallow `tokio-rs/tokio`
+/// clone: load was 99.7% of a `load`-then-`verify` call
+/// (`specs/receipts/chain-scope-20260914.md`).
+///
+/// This holds the *complete* graph [`ExplainGraph::load`] would have built,
+/// not a graph scoped to any one chain. A per-chain scoped load was the
+/// other shape this item named, and it does not hold up under inspection:
+/// every re-check that matters (`Fact::LiveDefinitions`,
+/// `Fact::CandidatePool`, `Fact::RuleApplication`, `Fact::CascadeOutcome`)
+/// re-derives its answer from indices built over the *whole* project's
+/// matching nodes (`index::resolve::build_indices`, keyed by
+/// `(name, node_type, language_family)` project-wide), not from the ids one
+/// chain happens to mention. Scoping the load to "the ids the chain names"
+/// would load exactly the rows the chain already claims and nothing else,
+/// so recomputing a pool or a live-definition set from that scope would
+/// just replay the chain's own claim back at it, silently vacuous in
+/// precisely the two tamper classes (`the_verifier_recomputes_the_candidate_pool_rather_than_trusting_it`-style
+/// candidate and candidate-pool tampering) this module's own tests exist to
+/// catch. A correct scoped load is possible (query by the specific
+/// `(bare, to_type, language_family)` and `name` keys a chain's facts
+/// name, not by the ids in its `NodeExists`/`CandidatePool` steps), but it
+/// is a materially larger and riskier change than caching the exact
+/// full-project answer, for a fix this item says should be justified by a
+/// measurement rather than by which shape sounded cheaper.
+#[derive(Clone)]
+pub struct ExplainGraphCache {
+    project_id: String,
+    entry: Arc<Mutex<Option<(Option<surrealdb_types::Value>, Arc<ExplainGraph>)>>>,
+}
+
+impl ExplainGraphCache {
+    pub fn new(project_id: String) -> Self {
+        Self {
+            project_id,
+            entry: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// The cached graph if the project's index watermark has not moved
+    /// since it was built, otherwise a fresh [`ExplainGraph::load`] that
+    /// becomes the new cached copy, unless that load itself straddled an
+    /// index run (see the mid-load race note below), in which case it is
+    /// returned for this call only and the cache is left untouched.
+    ///
+    /// **The mid-load race this guards against.** `ExplainGraph::load` runs
+    /// three separate queries (nodes, then name-edges, then deletion
+    /// records), and `project_registry.last_indexed_at` is written last, as
+    /// the final step of an `index` run (`index::mod`'s
+    /// `update_project_registry`). If a cold cache or a miss starts loading
+    /// while a run is mid-write, the watermark read *before* the load still
+    /// reads the *previous* run's value (the current run has not finished),
+    /// so the load's three queries can each see a different amount of the
+    /// run in progress, some new rows, some not yet, and the result would
+    /// get cached under that previous-run watermark. Nothing would then
+    /// invalidate it until the *next* run completes, so a torn snapshot
+    /// would be served for the rest of the run in progress. The fix is
+    /// read-load-read: read the watermark again after the load, and cache
+    /// the result only if it did not move. A caller in this narrow window
+    /// still gets a graph back (never an error), just not one that gets
+    /// remembered; the following call reads a watermark that has settled
+    /// and reloads cleanly.
+    ///
+    /// **Which stores can actually hit this.** An embedded `surrealkv://`
+    /// store takes a single-writer file lock; a second process cannot even
+    /// open a connection to it (`facade::explain_chains_for_symbol`'s docs
+    /// note the same lock causing a second connection to deadlock), so two
+    /// *separate processes* sharing one embedded store cannot race here at
+    /// all, indexing from a second process would fail to connect long
+    /// before it could write anything mid-load. The window is real for a
+    /// server-backed store (`ws://`/`wss://`), where a separate client can
+    /// index while this process serves `codegraph_verify_chain`, or for a
+    /// single process that runs an indexer and this cache against the same
+    /// connection (an in-process watch-and-reindex mode, which does not
+    /// exist in this codebase today).
+    pub async fn get(&self, db: &Surreal<Any>) -> Result<Arc<ExplainGraph>> {
+        let mut guard = self.entry.lock().await;
+        let watermark_before = current_watermark(db, &self.project_id).await?;
+        if let Some((cached_watermark, graph)) = guard.as_ref() {
+            if *cached_watermark == watermark_before {
+                return Ok(Arc::clone(graph));
+            }
+        }
+
+        let graph = Arc::new(ExplainGraph::load(db, &self.project_id).await?);
+        let watermark_after = current_watermark(db, &self.project_id).await?;
+        if should_cache(&watermark_before, &watermark_after) {
+            *guard = Some((watermark_after, Arc::clone(&graph)));
+        }
+        Ok(graph)
+    }
+}
+
+/// Whether a just-completed load is safe to remember: only when the
+/// watermark read before the load matches the one read after it, meaning no
+/// index run's `project_registry` write landed while the load's own
+/// queries were in flight. A pure function of the two readings so the
+/// decision itself is unit-testable without a database or real concurrency
+/// (see the `mod tests` below); [`ExplainGraphCache::get`] is the only
+/// caller.
+fn should_cache(before: &Option<surrealdb_types::Value>, after: &Option<surrealdb_types::Value>) -> bool {
+    before == after
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mark(s: &str) -> Option<surrealdb_types::Value> {
+        Some(surrealdb_types::Value::String(s.to_string()))
+    }
+
+    #[test]
+    fn should_cache_when_the_watermark_held_steady_across_the_load() {
+        assert!(should_cache(&mark("t1"), &mark("t1")));
+    }
+
+    #[test]
+    fn should_cache_when_the_project_has_never_been_indexed_on_either_read() {
+        assert!(should_cache(&None, &None));
+    }
+
+    #[test]
+    fn should_not_cache_when_an_index_run_completed_during_the_load() {
+        assert!(!should_cache(&mark("t1"), &mark("t2")));
+    }
+
+    #[test]
+    fn should_not_cache_when_the_first_index_run_ever_completed_during_the_load() {
+        // Before: the project had never been indexed (no project_registry
+        // row at all). After: the first run's row now exists. This is the
+        // sharpest case, since a naive `Option` comparison that treated
+        // "no row" as equal to "some row" would defeat the whole check.
+        assert!(!should_cache(&None, &mark("t1")));
     }
 }
 

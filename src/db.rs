@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use surrealdb::engine::any::Any;
 use surrealdb::opt::auth::Root;
@@ -109,18 +110,111 @@ fn explain_connect_failure(url: &str, error: surrealdb::Error) -> anyhow::Error 
     anyhow::Error::new(error).context(format!("Failed to connect to SurrealDB at {url}"))
 }
 
-/// Run idempotent schema DDL from the embedded schema.surql file.
-pub async fn init_schema(db: &Surreal<Any>) -> Result<()> {
-    let schema = include_str!("schema.surql");
-
-    // Execute the schema as a single multi-statement query.
-    // SurrealDB handles semicolon-delimited statements natively.
-    db.query(schema)
-        .await
-        .context("Schema DDL execution failed")?
-        .check()
-        .context("Schema DDL validation failed")?;
-
-    tracing::info!("Schema initialized (idempotent)");
-    Ok(())
+/// What a schema application actually did.
+///
+/// Returned rather than logged so a test can assert the skip happened
+/// without timing anything: a wall-clock assertion on DDL that got faster
+/// is a flaky test, and an assertion that no DDL ran is the real claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaInit {
+    /// The DDL ran, and the store now records this binary's version of it.
+    Applied,
+    /// The store already recorded this binary's version, so no DDL ran.
+    Skipped,
 }
+
+/// Where a store records which schema documents it carries.
+///
+/// Deliberately never `DEFINE`d anywhere. It has to be readable before any
+/// DDL has ever run against a brand new store, and an undefined, schemaless
+/// table is exactly that: readable, empty, and needing no bootstrap of its
+/// own. Defining it in `schema.surql` would put the version record behind
+/// the very DDL it exists to skip.
+const SCHEMA_META_TABLE: &str = "schema_meta";
+
+/// The version of a schema document, as recorded on a store.
+///
+/// The document's own SHA-256, not a hand-maintained integer. Editing a
+/// `.surql` file is then the bump, with no second place to remember: a
+/// counter someone has to increment by hand is a counter that eventually is
+/// not incremented, and that failure mode is a store silently running the
+/// previous release's DDL forever.
+fn schema_version(source: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(source.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Read the version of one schema document this store already carries.
+///
+/// `None` covers three states that all want the same answer, apply the DDL:
+/// a store that has never had this document applied, a store written by a
+/// build that predates versioning, and a store whose read failed. The last
+/// one is folded in deliberately rather than propagated. A fresh store has
+/// no `schema_meta` table at all and this engine errors on a read of an
+/// undefined table rather than returning nothing (the same behaviour
+/// `doctor`'s schema probe relies on), so an error here is the ordinary
+/// first-run case. Nothing is swallowed by doing so: the only consequence
+/// of a wrong `None` is that the DDL runs, and a store that is genuinely
+/// broken fails loudly on that DDL a few lines below.
+async fn stored_schema_version(db: &Surreal<Any>, key: &str) -> Option<String> {
+    let mut response = db
+        .query(format!(
+            "SELECT VALUE version FROM type::record('{SCHEMA_META_TABLE}', $key)"
+        ))
+        .bind(("key", key.to_string()))
+        .await
+        .ok()?;
+    let versions: Vec<String> = response.take(0).ok()?;
+    versions.into_iter().next()
+}
+
+/// Apply one schema document, unless the store already carries this exact
+/// version of it.
+///
+/// Every `codegraph` invocation that opens a store used to re-execute all 72
+/// idempotent `DEFINE` statements in `schema.surql`, or all 47 in
+/// `schema_plan.surql`, against a schema that had not changed. A flat tax
+/// per invocation, measured in `specs/receipts/index-profile-20260914.md`
+/// section 3.1 and root-caused in
+/// `specs/receipts/store-cost-20260914.md`, where it also turned out to be
+/// the whole of the query-side regression RF-3 had left open since July.
+/// One record read replaces it when nothing changed, and the DDL still runs
+/// in full the first time, after an upgrade, and after any edit to the
+/// document.
+pub async fn apply_schema(db: &Surreal<Any>, key: &str, source: &str) -> Result<SchemaInit> {
+    let wanted = schema_version(source);
+
+    if stored_schema_version(db, key).await.as_deref() == Some(wanted.as_str()) {
+        tracing::debug!("Schema {key} already at version {wanted}, skipping DDL");
+        return Ok(SchemaInit::Skipped);
+    }
+
+    db.query(source)
+        .await
+        .with_context(|| format!("{key} schema DDL execution failed"))?
+        .check()
+        .with_context(|| format!("{key} schema DDL validation failed"))?;
+
+    // Recorded only after `check` passed. A half-applied schema that claimed
+    // to be current would skip its own repair on the next run.
+    db.query(format!(
+        "UPSERT type::record('{SCHEMA_META_TABLE}', $key) \
+         SET key = $key, version = $version, updated_at = time::now()"
+    ))
+    .bind(("key", key.to_string()))
+    .bind(("version", wanted.clone()))
+    .await
+    .with_context(|| format!("recording the {key} schema version failed"))?
+    .check()
+    .with_context(|| format!("recording the {key} schema version was rejected"))?;
+
+    tracing::info!("Schema {key} applied (version {wanted})");
+    Ok(SchemaInit::Applied)
+}
+
+/// Run the core graph schema DDL, unless the store already carries it.
+pub async fn init_schema(db: &Surreal<Any>) -> Result<SchemaInit> {
+    apply_schema(db, "core", include_str!("schema.surql")).await
+}
+

@@ -169,7 +169,8 @@ explains most of that spread rather than a real per-language difference.
 `wrapped real` minus `phase-sum` is consistently ~0.6-2.0s across every repo regardless of
 size (cobra run 1: 4.29s - 2.29s = 2.0s; flask: 4.65s - 3.53s = 1.1s; codegraph-self:
 4.32s - 3.70s = 0.6s): process start (69MB binary, dylib linking), `db::connect`
-(signin+use_ns+use_db), and `db::init_schema` (20+ idempotent `DEFINE` DDL statements) all
+(signin+use_ns+use_db), and `db::init_schema` (72 core plus 47 plan idempotent `DEFINE`
+DDL statements; counted in `specs/receipts/store-cost-20260914.md` section 1) all
 happen before `index_project` starts timing. This is a genuine fixed tax on every `index`
 invocation, independent of repo size, and is invisible in a "s/file" framing since it
 doesn't shrink per file; on a 4-file repo it would dominate entirely.

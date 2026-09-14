@@ -247,16 +247,18 @@ impl PlanSnapshot {
 // Schema
 // ============================================================================
 
-/// Apply the plan tables' DDL. Idempotent, and cheap enough to run before
-/// every write. See the module docs for why it lives here and not in
-/// `db::init_schema`.
-pub async fn ensure_schema(db: &Surreal<Any>) -> Result<()> {
-    db.query(include_str!("../schema_plan.surql"))
-        .await
-        .context("plan schema DDL execution failed")?
-        .check()
-        .context("plan schema DDL validation failed")?;
-    Ok(())
+/// Apply the plan tables' DDL, unless the store already carries this exact
+/// version of it. See the module docs for why the document lives here and
+/// not in `db::init_schema`.
+///
+/// The version recorded is the document's own hash, so the self-healing
+/// property the module docs describe survives the skip intact: editing
+/// `schema_plan.surql` to add a field changes the hash, which makes every
+/// existing store re-run the `OVERWRITE` definitions on its next plan
+/// command. Only a store that already carries the byte-identical document
+/// skips, and for that store the DDL was a no-op anyway.
+pub async fn ensure_schema(db: &Surreal<Any>) -> Result<crate::db::SchemaInit> {
+    crate::db::apply_schema(db, "plan", include_str!("../schema_plan.surql")).await
 }
 
 // ============================================================================

@@ -656,6 +656,30 @@ fn find_stale_references(
 /// (`target::helper` queried as `helper`) and it stays matched
 /// unconditionally.
 ///
+/// That same no-live-definition branch is the *only* place the **receiver**
+/// rule applies. A capture can name the queried symbol in a position other
+/// than the tail: `searchAndReplaceInFileTool.preprocess` normalizes to
+/// `searchAndReplaceInFileTool::preprocess`, whose bare tail is
+/// `preprocess`, so a query for the receiver could never match it and a
+/// call through a deleted object went unreported (measured:
+/// `specs/receipts/extractor-gaps-20260914.md`, gap G3). When the
+/// queried name has no live definition left anywhere in the project, a
+/// capture whose *non-final* segments include that name is a reference
+/// through the vanished symbol and is reported.
+///
+/// This cannot re-open the class 833c17f closed. That class was a
+/// **qualified capture bare-tailing onto a symbol that is still there**
+/// (`cursor.node` reported against a live `fn node()`), and it is decided
+/// entirely by the branch below, which is byte-for-byte unchanged: while
+/// one definition of the queried name survives, the receiver rule is never
+/// consulted. The receiver rule also never inspects the tail segment, so
+/// the `cursor.node` shape cannot reach it by that route either; it would
+/// take a project where `cursor` itself was a definition that deletion
+/// tracking has recorded as gone, in which case a call on it *is* stale.
+/// Since `live.is_empty()` already matched a bare capture unconditionally
+/// before this change, the new branch is narrower in kind than one the scan
+/// already had.
+///
 /// Residual, deliberate: a rename whose bare name is *also* still defined
 /// somewhere else in the project takes the strict branch, so a *qualified*
 /// stale capture pointing at the vanished one can be missed. Closing that
@@ -689,7 +713,7 @@ fn is_stale_candidate(
 ) -> bool {
     let normalized = normalize_separators(raw_to_name);
     if bare_name(&normalized) != queried_bare {
-        return false;
+        return live.is_empty() && names_a_receiver(&normalized, queried_bare);
     }
     if live.is_empty() {
         return true;
@@ -703,6 +727,18 @@ fn is_stale_candidate(
             && language_family(&n.language) == family
             && (!qualified || n.qualified_name == normalized || n.qualified_name.ends_with(&suffix))
     })
+}
+
+/// Does `normalized` (an already-separator-normalized capture) name
+/// `queried_bare` in **receiver** position, i.e. as one of its segments
+/// other than the last? `searchAndReplaceInFileTool::preprocess` names
+/// `searchAndReplaceInFileTool` this way. The tail is deliberately excluded:
+/// it is the bare-name case the caller already decided, and letting it fall
+/// through here would be the bare-tail fallback `resolve_one` forbids.
+fn names_a_receiver(normalized: &str, queried_bare: &str) -> bool {
+    let mut segments: Vec<&str> = normalized.split("::").collect();
+    segments.pop();
+    segments.iter().any(|s| *s == queried_bare)
 }
 
 #[cfg(test)]
@@ -952,6 +988,121 @@ mod tests {
         let renamed = vec![nodes[0].clone()];
         let gone = compute_reverse_dependencies(&renamed, &edges, "Lcg", 3, false);
         assert_eq!(gone.stale_references.len(), 1);
+    }
+
+    /// G3 (`specs/receipts/extractor-gaps-20260914.md`): the
+    /// deleted symbol sits in **receiver** position at the call site.
+    /// `extensions/cli/src/tools/preprocess.test.ts` calls
+    /// `searchAndReplaceInFileTool.preprocess(...)` five times after
+    /// `tools/searchAndReplace/index.ts`, which exported
+    /// `searchAndReplaceInFileTool`, was deleted. The capture's bare tail is
+    /// `preprocess`, so a query for the receiver matched nothing and the
+    /// gate stayed silent on a deletion the project itself fixed one commit
+    /// later.
+    #[test]
+    fn deleted_receiver_is_a_stale_reference() {
+        let mut caller = node(
+            "caller",
+            "preprocess.test",
+            "module",
+            "tools/preprocess.test.ts",
+            "tools::preprocess.test::preprocess.test",
+        );
+        caller.language = "typescript".to_string();
+
+        let nodes = vec![caller];
+        let edges = vec![edge(
+            "UNRESOLVED",
+            "caller",
+            "",
+            "searchAndReplaceInFileTool.preprocess",
+            vec![],
+        )];
+
+        let result =
+            compute_reverse_dependencies(&nodes, &edges, "searchAndReplaceInFileTool", 3, false);
+        assert_eq!(
+            result.stale_references.len(),
+            1,
+            "a call through a deleted receiver is a stale reference, got {:?}",
+            result.stale_references
+        );
+        assert_eq!(
+            result.stale_references[0].to_name,
+            "searchAndReplaceInFileTool.preprocess"
+        );
+    }
+
+    /// The specificity half of the receiver rule, and the reason it cannot
+    /// re-open 833c17f's class: it is consulted only when the queried name
+    /// has no live definition left. While the receiver is still defined, a
+    /// call on it is an ordinary unresolved method reference to a healthy
+    /// symbol, not a stale one.
+    #[test]
+    fn live_receiver_is_not_a_stale_reference() {
+        let mut caller = node(
+            "caller",
+            "preprocess.test",
+            "module",
+            "tools/preprocess.test.ts",
+            "tools::preprocess.test::preprocess.test",
+        );
+        caller.language = "typescript".to_string();
+        let mut target = node(
+            "tool",
+            "searchAndReplaceInFileTool",
+            "object",
+            "tools/searchAndReplace/index.ts",
+            "tools::searchAndReplace::index::searchAndReplaceInFileTool",
+        );
+        target.language = "typescript".to_string();
+
+        let nodes = vec![caller, target];
+        let edges = vec![edge(
+            "UNRESOLVED",
+            "caller",
+            "",
+            "searchAndReplaceInFileTool.preprocess",
+            vec![],
+        )];
+
+        let result =
+            compute_reverse_dependencies(&nodes, &edges, "searchAndReplaceInFileTool", 3, false);
+        assert!(
+            result.stale_references.is_empty(),
+            "the receiver is right there and undeleted, got {:?}",
+            result.stale_references
+        );
+    }
+
+    /// The receiver rule never reads the tail segment, so the exact shape
+    /// 833c17f closed stays closed even once its target is gone by another
+    /// name: a query for `cursor` (not `node`) is what `cursor.node` can
+    /// match, and only when `cursor` was itself a deleted definition.
+    #[test]
+    fn receiver_rule_never_matches_on_the_tail() {
+        let nodes = vec![node(
+            "walker",
+            "walk_calls",
+            "function",
+            "src/index/extractors/rust.rs",
+            "extractors::rust::walk_calls",
+        )];
+        let edges = vec![edge("UNRESOLVED", "walker", "", "cursor.node", vec![])];
+
+        // `node` is gone project-wide. The bare-tail branch (which predates
+        // the receiver rule) matches it, as it always has.
+        let tail = compute_reverse_dependencies(&nodes, &edges, "node", 3, false);
+        assert_eq!(tail.stale_references.len(), 1);
+
+        // A name that appears in neither position matches nothing, even
+        // with an empty live set.
+        let neither = compute_reverse_dependencies(&nodes, &edges, "goto_parent", 3, false);
+        assert!(
+            neither.stale_references.is_empty(),
+            "no segment of `cursor.node` names `goto_parent`, got {:?}",
+            neither.stale_references
+        );
     }
 
     /// A cross-language bare collision is not a stale reference either:

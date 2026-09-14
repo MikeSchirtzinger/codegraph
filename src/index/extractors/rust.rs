@@ -112,8 +112,77 @@ fn extract_function(ctx: &mut ExtractionContext, node: Node, enclosing_id: Optio
     if ctx.tier != IndexingTier::Fast {
         if let Some(body) = node.child_by_field_name("body") {
             extract_calls(ctx, body, &fn_id);
+            extract_closure_bindings(ctx, body, &fn_id);
         }
     }
+}
+
+/// G4 (`specs/receipts/extractor-gaps-20260914.md`): a closure bound to a name is a definition.
+///
+/// `let base_event = |base: &BaseEvent| { … };` in a private Rust codebase
+/// was not modeled, so
+/// after an unrelated `fn base_event()` was deleted from a sibling file the
+/// graph held zero live definitions for the name, every one of the 24 calls
+/// to the closure stayed UNRESOLVED, and the stale scan's deleted-name
+/// branch reported all of them. That was the only false positive in four
+/// replay audits. With the binding modeled, R3 (same-file bare name) binds
+/// those calls, they never reach the stale scan, and the finding disappears
+/// at its source rather than being filtered out downstream.
+///
+/// The closure's own body is deliberately *not* walked again for calls: the
+/// enclosing function's `extract_calls` already walked the whole body,
+/// including this subtree, and attributing the same call twice would inflate
+/// every edge count for no new information.
+fn extract_closure_bindings(ctx: &mut ExtractionContext, body: Node, enclosing_id: &str) {
+    let mut cursor = body.walk();
+    walk_closure_bindings(ctx, &mut cursor, enclosing_id);
+}
+
+fn walk_closure_bindings(
+    ctx: &mut ExtractionContext,
+    cursor: &mut tree_sitter::TreeCursor,
+    enclosing_id: &str,
+) {
+    if !cursor.goto_first_child() {
+        return;
+    }
+
+    loop {
+        let node = cursor.node();
+        if node.kind() == "let_declaration" {
+            let value = node.child_by_field_name("value");
+            let pattern = node.child_by_field_name("pattern");
+            if let (Some(value), Some(pattern)) = (value, pattern) {
+                // Only a plain `let name = |…|`. A destructuring pattern
+                // binds no single symbol another file could call.
+                if value.kind() == "closure_expression" && pattern.kind() == "identifier" {
+                    let name = ctx.node_text(pattern).to_string();
+                    if !name.is_empty() {
+                        let start = node.start_position().row as u32 + 1;
+                        let end = value.end_position().row as u32 + 1;
+                        let content = Some(truncate_safe(ctx.node_text(node), 2000));
+                        let id = ctx.add_node(
+                            &name,
+                            "function",
+                            Some(start),
+                            Some(end),
+                            content,
+                            HashMap::new(),
+                        );
+                        ctx.add_edge(enclosing_id, &id, "contains", "EXTRACTED");
+                    }
+                }
+            }
+        }
+
+        walk_closure_bindings(ctx, cursor, enclosing_id);
+
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+
+    cursor.goto_parent();
 }
 
 fn extract_struct(ctx: &mut ExtractionContext, node: Node) {
@@ -571,5 +640,68 @@ mod tests {
             .find(|n| n.name == "foo")
             .expect("foo node in src/lib.rs");
         assert_eq!(lib_foo.qualified_name, "foo");
+    }
+
+    /// G4 (`specs/receipts/extractor-gaps-20260914.md`), the shape
+    /// measured on a private Rust codebase: a closure bound to a name, called
+    /// from the function that binds it. Unmodeled, the
+    /// name had no live definition anywhere once an unrelated `fn
+    /// base_event()` was deleted elsewhere, and all 24 call sites were
+    /// reported as stale references to the deleted function.
+    #[test]
+    fn a_named_closure_binding_is_a_definition() {
+        let src = "fn agui_to_proto() {\n    let base_event = |base: &BaseEvent| {\n        base.id()\n    };\n    base_event(&a);\n    base_event(&b);\n}\n";
+        let nodes = extract_source("src/event_converter.rs", src);
+        let closure = nodes
+            .iter()
+            .find(|n| n.name == "base_event")
+            .expect("the closure binding must be a definition node");
+        assert_eq!(closure.node_type, "function");
+        assert_eq!(
+            closure.qualified_name,
+            "event_converter::agui_to_proto::base_event",
+            "it is contained by the function that binds it"
+        );
+    }
+
+    /// The specificity half of G4: an ordinary `let` is not a definition,
+    /// and a destructuring pattern binds no single callable name.
+    #[test]
+    fn a_plain_let_binding_is_not_a_definition() {
+        let src = "fn run() {\n    let total = compute();\n    let (a, b) = pair();\n}\n";
+        let nodes = extract_source("src/app.rs", src);
+        let names: Vec<&String> = nodes.iter().map(|n| &n.name).collect();
+        assert!(!names.iter().any(|n| *n == "total"), "got {names:?}");
+        assert!(!names.iter().any(|n| *n == "a"), "got {names:?}");
+    }
+
+    /// A closure's calls stay attributed to the function that owns the body,
+    /// counted once. The closure node exists to be a resolution target, not
+    /// to re-attribute work the enclosing walk already did.
+    #[test]
+    fn a_closure_body_is_not_walked_for_calls_twice() {
+        let src = "fn outer() {\n    let inner = || {\n        helper();\n    };\n    inner();\n}\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("load rust grammar");
+        let tree = parser.parse(src, None).expect("parse rust source");
+        let mut ctx = ExtractionContext {
+            project_id: "test".to_string(),
+            file_path: "src/app.rs".to_string(),
+            language: "rust".to_string(),
+            source: src.to_string(),
+            tier: IndexingTier::Full,
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        };
+        extract(&mut ctx, tree.root_node());
+
+        let helper_edges = ctx
+            .edges
+            .iter()
+            .filter(|e| e.to_name.as_deref() == Some("helper"))
+            .count();
+        assert_eq!(helper_edges, 1, "one call, one edge");
     }
 }

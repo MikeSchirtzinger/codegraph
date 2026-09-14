@@ -14,9 +14,14 @@ existed before R5):
                 (the query itself, result formatting/printing, and process
                 teardown)
 
-`query`/`stats` (unlike `index`/`resolve`) never call `db::init_schema`
-(confirmed by reading src/main.rs's command dispatch), so phase_open here
-is purely the embedded surrealkv engine's connect cost, not schema DDL.
+`query` calls `db::init_schema` on connect, exactly as `index` and
+`resolve` do (src/main.rs's `Commands::Query` arm, added 2026-07-10 in
+`6b487e4`). It lands entirely in phase_rest, since the "Connected..." line
+that splits the phases fires before it. An earlier version of this
+docstring claimed `query` never called it, which is what let the
+2026-07-30 re-measurement read a 12 to 17x phase_rest regression as an
+unexplained query cost for two months. It was the schema DDL, and RF-7
+removed it: see specs/receipts/store-cost-20260914.md.
 
 The "Connected..." line is timestamped by *this script*, the instant it
 arrives on the child's stderr pipe (line-buffered; stdout is discarded to

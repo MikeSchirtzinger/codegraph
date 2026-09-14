@@ -51,8 +51,8 @@ use surrealdb::engine::any::Any;
 use surrealdb::Surreal;
 
 use codegraph::graph::clones::find_clone_groups;
-use codegraph::graph::explain::{self, Chain, ChainVerdict, ExplainGraph};
-use codegraph::index::IndexingTier;
+use codegraph::graph::explain::{self, Chain, ChainVerdict, ExplainGraph, Membership};
+use codegraph::index::{index_project, IndexConfig, IndexingTier};
 use codegraph::mcp::server::{
     ArchitectureParams, ClonesParams, CodegraphServer, ImpactParams, PlanBlastParams,
     PlanListParams, PlanShowParams, PlanSyncParams, PlanTouchingParams, VerifyChainParams,
@@ -140,8 +140,17 @@ const WIRE_RENAME_IMPACT: &str = "Impact analysis for 'helper': 0 dependent(s) (
 const WIRE_POLYGLOT_MISSING: &str = "'no_such_symbol_anywhere' has no reverse dependencies";
 
 /// Same capture, `codegraph_architecture` with no `file_filter`.
+///
+/// Re-captured 2026-09-14 on `lane/extractor-gaps`, and the three changed
+/// counts are all one node and one edge in `client/src/index.ts`, which ends
+/// in a top-level `run();`. Closing G2 (see `src/index/extractors/
+/// typescript.rs`) means module-scope code is no longer invisible, so that
+/// file gains one `module` node and the call it makes becomes one `calls`
+/// edge: `module: 1` appears, `typescript` goes 8 -> 9, `calls` goes
+/// 12 -> 13. `function`, `import`, `go`, `python` and `file_ref` are
+/// unchanged. Receipt: `specs/receipts/extractor-gaps-20260914.md`.
 const WIRE_POLYGLOT_ARCH_NODE_TYPES: &str =
-    "## Project Structure\n\n**Node types:**\n- function: 10\n- import: 5\n\n**Languages:**\n- typescript: 8\n- go: 4\n- python: 3\n\n**Edge types:**\n- calls: 12\n- file_ref: 4\n";
+    "## Project Structure\n\n**Node types:**\n- function: 10\n- import: 5\n- module: 1\n\n**Languages:**\n- typescript: 9\n- go: 4\n- python: 3\n\n**Edge types:**\n- calls: 13\n- file_ref: 4\n";
 
 #[tokio::test]
 async fn impact_with_explain_off_is_byte_identical_to_the_captured_wire_output() {
@@ -563,6 +572,82 @@ async fn the_tool_reports_the_same_verdict_the_library_produces() {
 
     let out = verdict_for(&server, serde_json::to_value(&chain).unwrap()).await;
     assert_eq!(verdict_json(&out), direct);
+}
+
+/// RF-6: `codegraph_verify_chain` now
+/// checks chains against a cached graph rather than a fresh
+/// `ExplainGraph::load` per call (`ExplainGraphCache`, `src/graph/explain.rs`).
+/// The unit-level cache tests live in `tests/explain.rs`; this is the
+/// integration proof that the caching is actually wired into the tool a
+/// client calls, not just into a type nothing uses it through: two real
+/// `codegraph_verify_chain` calls on one live `CodegraphServer`, with an
+/// incremental re-index run between them, must disagree exactly as they
+/// would without the cache.
+#[tokio::test]
+async fn verify_chain_reflects_a_reindex_that_happens_between_two_calls() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).expect("mkdir");
+    let write = |rel: &str, body: &str| std::fs::write(root.join(rel), body).expect("write");
+    write("src/caller.rs", "pub fn call_it() {\n    orphan_target();\n}\n");
+
+    let project_id = "mcp-cache-invalidate";
+    let db = fresh_db().await.expect("store");
+    index_project(
+        &db,
+        &IndexConfig {
+            project_id: project_id.to_string(),
+            root_path: root.to_path_buf(),
+            tier: IndexingTier::Balanced,
+            languages: None,
+            force: true,
+        },
+    )
+    .await
+    .expect("fresh index");
+
+    let server = CodegraphServer::new(Arc::clone(&db), project_id.to_string());
+
+    // Build the chain once, off a one-off load (not the server's cache):
+    // what the chain says is fixed from here on, only the live graph moves.
+    let graph = ExplainGraph::load(&db, project_id).await.expect("graph");
+    let chains = explain::explain_symbol(&graph, project_id, "orphan_target", &Membership::ExplicitSymbol);
+    let chain = chains
+        .into_iter()
+        .find(|c| c.finding == codegraph::graph::explain::FindingKind::StaleReference)
+        .expect("orphan_target must produce a stale-reference chain");
+    let chain_json = serde_json::to_value(&chain).unwrap();
+
+    let first = verdict_for(&server, chain_json.clone()).await;
+    assert!(
+        verdict_json(&first).ok,
+        "the chain must verify clean before the definition exists:\n{first}"
+    );
+
+    // The project changes: a new file defines the symbol. Same db, same
+    // server, same cache; only an incremental index run happens between
+    // the two tool calls, exactly as it would with a live indexer running
+    // alongside a long MCP session.
+    write("src/target.rs", "pub fn orphan_target() {}\n");
+    index_project(
+        &db,
+        &IndexConfig {
+            project_id: project_id.to_string(),
+            root_path: root.to_path_buf(),
+            tier: IndexingTier::Balanced,
+            languages: None,
+            force: false,
+        },
+    )
+    .await
+    .expect("incremental index");
+
+    let second = verdict_for(&server, chain_json).await;
+    assert!(
+        !verdict_json(&second).ok,
+        "the same chain must fail once the reindex the server's cache should have \
+         picked up makes it false, not keep passing the stale answer:\n{second}"
+    );
 }
 
 // ============================================================================
